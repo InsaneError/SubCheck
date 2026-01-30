@@ -68,6 +68,20 @@ class SubCheckBot(loader.Module):
     async def delete_not_subscribed_msg(self, user_id):
         if str(user_id) in self.not_subscribed_msgs:
             try:
+                # Открепляем сообщение перед удалением
+                if self.pin_enabled:
+                    try:
+                        await self.client(UpdatePinnedMessageRequest(
+                            peer=user_id,
+                            id=self.not_subscribed_msgs[str(user_id)],
+                            silent=True,
+                            unpin=True  # Открепляем
+                        ))
+                        print(f"Сообщение откреплено для пользователя {user_id}")
+                    except Exception as e:
+                        print(f"Ошибка при откреплении сообщения: {e}")
+                
+                # Удаляем сообщение
                 await self.client.delete_messages(user_id, self.not_subscribed_msgs[str(user_id)])
             except:
                 pass
@@ -398,6 +412,20 @@ class SubCheckBot(loader.Module):
         for user_id_str in list(self.not_subscribed_msgs.keys()):
             user_id = int(user_id_str)
             try:
+                # Открепляем сообщение перед удалением
+                if self.pin_enabled:
+                    try:
+                        await self.client(UpdatePinnedMessageRequest(
+                            peer=user_id,
+                            id=self.not_subscribed_msgs[user_id_str],
+                            silent=True,
+                            unpin=True  # Открепляем
+                        ))
+                        print(f"Сообщение откреплено для пользователя {user_id}")
+                    except Exception as e:
+                        print(f"Ошибка при откреплении сообщения: {e}")
+                
+                # Удаляем сообщение
                 await self.client.delete_messages(user_id, self.not_subscribed_msgs[user_id_str])
                 count += 1
             except:
@@ -406,4 +434,4 @@ class SubCheckBot(loader.Module):
         self.not_subscribed_msgs = {}
         self.db.set("SubChecker", "not_subscribed_msgs", self.not_subscribed_msgs)
         
-        await utils.answer(message, f"<b>Удалено {count} сообщений о подписке</b>") 
+        await utils.answer(message, f"<b>Удалено {count} сообщений о подписке</b>")
