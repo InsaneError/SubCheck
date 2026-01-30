@@ -4,7 +4,6 @@ from telethon.tl.functions.messages import ReportSpamRequest
 from telethon.tl.types import User
 from telethon.tl.functions.messages import UpdatePinnedMessageRequest
 from .. import loader, utils
-import json
 
 @loader.tds
 class SubCheckBot(loader.Module):
@@ -29,16 +28,13 @@ class SubCheckBot(loader.Module):
         'pinned_enabled': "<b>Закреп сообщений включен!</b>\nСообщения с просьбой подписаться будут закрепляться.",
         'pinned_disabled': "<b>Закреп сообщений отключен!</b>\nСообщения с просьбой подписаться не будут закрепляться.",
         'pinned_status': "<b>Статус закрепа сообщений:</b> {}",
-        'whitelist_added': "<b>Пользователь добавлен в белый список!</b>\n\nID: <code>{}</code>\nПричина: {}",
+        'whitelist_added': "<b>Пользователь добавлен в белый список!</b>\n\nID: <code>{}</code>",
         'whitelist_removed': "<b>Пользователь удален из белого списка!</b>\n\nID: <code>{}</code>",
         'whitelist_not_found': "<b>Пользователь не найден в белом списке!</b>",
         'whitelist_empty': "<b>Белый список пуст!</b>",
         'whitelist_cleared': "<b>Белый список очищен!</b>\n\nУдалено пользователей: {}",
         'whitelist_list': "<b>Белый список пользователей:</b>\n\n{}",
-        'whitelist_imported': "<b>Белый список импортирован!</b>\n\nДобавлено пользователей: {}",
-        'whitelist_exported': "<b>Белый список экспортирован!</b>\n\nПользователей в файле: {}",
-        'whitelist_import_error': "<b>Ошибка импорта белого списка!</b>\n\n{}",
-        'user_in_whitelist': "<b>Пользователь в белом списке</b>\n\nID: <code>{}</code>\nПричина: {}\nДобавлен: {}",
+        'user_in_whitelist': "<b>Пользователь в белом списке</b>\n\nID: <code>{}</code>\nДобавлен: {}",
         'user_not_in_whitelist': "<b>Пользователь не в белом списке!</b>",
         'invalid_user_id': "<b>Неверный ID пользователя!</b>\nID должен быть числом.",
         'no_reply': "<b>Ответьте на сообщение пользователя или укажите ID!</b>"
@@ -90,11 +86,10 @@ class SubCheckBot(loader.Module):
         """Проверка, находится ли пользователь в белом списке"""
         return str(user_id) in self.whitelist
 
-    def add_to_whitelist(self, user_id, reason="Не указана", added_by=None):
+    def add_to_whitelist(self, user_id, added_by=None):
         """Добавление пользователя в белый список"""
         from datetime import datetime
         self.whitelist[str(user_id)] = {
-            'reason': reason,
             'added_by': added_by,
             'added_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'user_id': user_id
@@ -164,13 +159,11 @@ class SubCheckBot(loader.Module):
             total_users = len(self.whitelist)
             status = f"<b>Белый список:</b> {total_users} пользователей\n\n"
             status += "<b>Команды:</b>\n"
-            status += ".subwl add [ID] [причина] - добавить пользователя\n"
+            status += ".subwl add [ID] - добавить пользователя\n"
             status += ".subwl remove [ID] - удалить пользователя\n"
             status += ".subwl list - показать список\n"
             status += ".subwl clear - очистить список\n"
             status += ".subwl check [ID] - проверить пользователя\n"
-            status += ".subwl import - импорт из JSON\n"
-            status += ".subwl export - экспорт в JSON\n"
             await utils.answer(message, status)
             return
         
@@ -179,7 +172,7 @@ class SubCheckBot(loader.Module):
         
         if command == "add":
             if len(parts) < 2:
-                await utils.answer(message, "<b>Используйте:</b> .subwl add [ID] [причина]\n<b>Или ответьте на сообщение пользователя:</b> .subwl add [причина]")
+                await utils.answer(message, "<b>Используйте:</b> .subwl add [ID]\n<b>Или ответьте на сообщение пользователя:</b> .subwl add")
                 return
             
             # Проверка, есть ли reply
@@ -187,12 +180,10 @@ class SubCheckBot(loader.Module):
                 reply = await message.get_reply_message()
                 user = await reply.get_sender()
                 user_id = user.id
-                reason = parts[1] if len(parts) > 1 else "Не указана"
             else:
                 try:
-                    user_id = int(parts[1].split()[0])
-                    reason = parts[1].split(" ", 1)[1] if len(parts[1].split()) > 1 else "Не указана"
-                except (ValueError, IndexError):
+                    user_id = int(parts[1])
+                except ValueError:
                     await utils.answer(message, self.strings['invalid_user_id'])
                     return
             
@@ -202,8 +193,8 @@ class SubCheckBot(loader.Module):
                 return
             
             # Добавление в белый список
-            self.add_to_whitelist(user_id, reason, message.sender_id)
-            await utils.answer(message, self.strings['whitelist_added'].format(user_id, reason))
+            self.add_to_whitelist(user_id, message.sender_id)
+            await utils.answer(message, self.strings['whitelist_added'].format(user_id))
             
             # Если у пользователя было сообщение о подписке, удаляем его
             if str(user_id) in self.not_subscribed_msgs:
@@ -238,14 +229,13 @@ class SubCheckBot(loader.Module):
                 await utils.answer(message, self.strings['whitelist_empty'])
                 return
             
-            text = self.strings['whitelist_list'].format("")
+            text = "<b>Белый список пользователей:</b>\n\n"
             count = 0
             
             for user_id_str, data in self.whitelist.items():
                 try:
                     user_id = int(user_id_str)
                     user_info = f"<b>ID:</b> <code>{user_id}</code>\n"
-                    user_info += f"<b>Причина:</b> {data.get('reason', 'Не указана')}\n"
                     user_info += f"<b>Добавлен:</b> {data.get('added_at', 'Неизвестно')}\n"
                     
                     # Попробуем получить имя пользователя
@@ -298,61 +288,10 @@ class SubCheckBot(loader.Module):
                 data = self.whitelist[str(user_id)]
                 await utils.answer(message, self.strings['user_in_whitelist'].format(
                     user_id, 
-                    data.get('reason', 'Не указана'),
                     data.get('added_at', 'Неизвестно')
                 ))
             else:
                 await utils.answer(message, self.strings['user_not_in_whitelist'])
-        
-        elif command == "import":
-            if not message.file:
-                await utils.answer(message, "<b>Прикрепите JSON файл с белым списком!</b>\n\nФормат: [{'user_id': 123456, 'reason': 'причина'}, ...]")
-                return
-            
-            try:
-                file = await message.download_media(bytes)
-                data = json.loads(file.decode('utf-8'))
-                
-                imported = 0
-                for item in data:
-                    if 'user_id' in item:
-                        user_id = item['user_id']
-                        reason = item.get('reason', 'Импортировано')
-                        if not self.is_whitelisted(user_id):
-                            self.add_to_whitelist(user_id, reason, message.sender_id)
-                            imported += 1
-                
-                await utils.answer(message, self.strings['whitelist_imported'].format(imported))
-                
-            except Exception as e:
-                await utils.answer(message, self.strings['whitelist_import_error'].format(str(e)))
-        
-        elif command == "export":
-            if not self.whitelist:
-                await utils.answer(message, self.strings['whitelist_empty'])
-                return
-            
-            # Создаем список для экспорта
-            export_list = []
-            for user_id_str, data in self.whitelist.items():
-                export_list.append({
-                    'user_id': int(user_id_str),
-                    'reason': data.get('reason', 'Не указана'),
-                    'added_by': data.get('added_by'),
-                    'added_at': data.get('added_at'),
-                    'exported_at': utils.get_datetime_now().strftime("%Y-%m-%d %H:%M:%S")
-                })
-            
-            # Сохраняем в JSON
-            json_data = json.dumps(export_list, indent=2, ensure_ascii=False)
-            filename = f"whitelist_{utils.get_datetime_now().strftime('%Y%m%d_%H%M%S')}.json"
-            
-            await message.respond(
-                file=json_data.encode('utf-8'),
-                attributes=[types.DocumentAttributeFilename(filename)]
-            )
-            
-            await utils.answer(message, self.strings['whitelist_exported'].format(len(export_list)))
         
         else:
             await utils.answer(message, "<b>Неизвестная команда!</b>\n\nИспользуйте .subwl для списка команд")
@@ -378,7 +317,7 @@ class SubCheckBot(loader.Module):
 
     @loader.command()
     async def submessage(self, message):
-        """Установить кастомное сообщение используйте {channel_link}"""
+        """Кастомное сообщение, используйте {channel_link} """
         args = utils.get_args_raw(message)
         
         if not args:
