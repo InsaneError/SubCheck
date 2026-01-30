@@ -1,13 +1,15 @@
 from telethon import events, Button
-from telethon.tl.functions.contacts import BlockRequest, UnblockRequest
-from telethon.tl.functions.messages import ReportSpamRequest
-from telethon.tl.types import User
 from telethon.tl.functions.messages import UpdatePinnedMessageRequest
+from telethon.tl.types import InputPeerChannel
+from telethon.errors import ChatAdminRequiredError
 from .. import loader, utils
+import asyncio
+import re
+import time
 
 @loader.tds
 class SubCheckBot(loader.Module):
-    """Буст канала от @InsModule"""
+    """Модуль проверки подписки на канал"""
     
     strings = {
         'name': 'SubChecker',
@@ -37,32 +39,123 @@ class SubCheckBot(loader.Module):
         'user_in_whitelist': "<b>Пользователь в белом списке</b>\n\nID: <code>{}</code>\nДобавлен: {}",
         'user_not_in_whitelist': "<b>Пользователь не в белом списке!</b>",
         'invalid_user_id': "<b>Неверный ID пользователя!</b>\nID должен быть числом.",
-        'no_reply': "<b>Ответьте на сообщение пользователя или укажите ID!</b>"
+        'no_reply': "<b>Ответьте на сообщение пользователя или укажите ID!</b>",
+        'stats': "<b>Статистика модуля:</b>\n\n{stats_info}",
+        'status': "<b>Статус модуля:</b>\n{status_info}",
+        'already_subscribed': "<b>Вы уже подписаны на наш канал!</b>",
+        'auto_clean_started': "<b>Автоочистка запущена!</b>\n\nБудут очищены сообщения о подписке у пользователей, которые подписались на канал.",
+        'auto_clean_finished': "<b>Автоочистка завершена!</b>\n\nОчищено сообщений: {cleaned_count}\nВсего пользователей в базе: {total_count}"
     }
+
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "channel_username",
+                "",
+                "Юзернейм канала для проверки подписки",
+                validator=loader.validators.String()
+            ),
+            loader.ConfigValue(
+                "channel_link",
+                "",
+                "Ссылка на канал",
+                validator=loader.validators.String()
+            ),
+            loader.ConfigValue(
+                "channel_id",
+                None,
+                "ID канала",
+                validator=loader.validators.Union(
+                    loader.validators.NoneType(),
+                    loader.validators.Integer()
+                )
+            ),
+            loader.ConfigValue(
+                "custom_message",
+                "",
+                "Кастомное сообщение (используйте {channel_link})",
+                validator=loader.validators.String()
+            ),
+            loader.ConfigValue(
+                "pin_enabled",
+                True,
+                "Включить закреп сообщений",
+                validator=loader.validators.Boolean()
+            ),
+            loader.ConfigValue(
+                "enabled",
+                True,
+                "Включить проверку подписки",
+                validator=loader.validators.Boolean()
+            ),
+            loader.ConfigValue(
+                "not_subscribed_msgs",
+                {},
+                "ID сообщений о неподписке",
+                validator=loader.validators.Dict()
+            ),
+            loader.ConfigValue(
+                "whitelist",
+                {},
+                "Белый список пользователей",
+                validator=loader.validators.Dict()
+            ),
+            loader.ConfigValue(
+                "delete_system_notifications",
+                True,
+                "Удалять системные уведомления о закреплении",
+                validator=loader.validators.Boolean()
+            ),
+            loader.ConfigValue(
+                "stats_counters",
+                {
+                    "messages_checked": 0,
+                    "subscriptions_verified": 0,
+                    "bots_detected": 0,
+                    "messages_sent": 0,
+                    "messages_deleted": 0
+                },
+                "Статистика работы модуля",
+                validator=loader.validators.Dict()
+            ),
+            loader.ConfigValue(
+                "last_auto_clean",
+                0,
+                "Время последней автоочистки",
+                validator=loader.validators.Integer()
+            )
+        )
 
     async def client_ready(self, client, db):
         self.client = client
         self.db = db
         
-        # Загрузка настроек канала
-        self.channel_username = self.db.get("SubChecker", "channel_username", "")
-        self.channel_link = self.db.get("SubChecker", "channel_link", "")
-        self.channel_id = self.db.get("SubChecker", "channel_id", None)
+        # Загрузка настроек из конфига
+        self.channel_username = self.config["channel_username"]
+        self.channel_link = self.config["channel_link"]
+        self.channel_id = self.config["channel_id"]
         
         # Загрузка сообщений о неподписке
-        self.not_subscribed_msgs = self.db.get("SubChecker", "not_subscribed_msgs", {})
+        self.not_subscribed_msgs = self.config["not_subscribed_msgs"]
         
         # Загрузка кастомного сообщения
-        self.custom_message = self.db.get("SubChecker", "custom_message", "")
+        self.custom_message = self.config["custom_message"]
         
-        # Загрузка настройки закрепа
-        self.pin_enabled = self.db.get("SubChecker", "pin_enabled", True)
+        # Загрузка настроек
+        self.pin_enabled = self.config["pin_enabled"]
+        self.enabled = self.config["enabled"]
+        self.delete_system_notifications = self.config["delete_system_notifications"]
         
         # Загрузка белого списка
-        self.whitelist = self.db.get("SubChecker", "whitelist", {})
+        self.whitelist = self.config["whitelist"]
         
-        # Включение/выключение модуля
-        self.enabled = self.db.get("SubChecker", "enabled", True)
+        # Загрузка статистики
+        self.stats_counters = self.config["stats_counters"]
+        self.last_auto_clean = self.config["last_auto_clean"]
+        
+        # Запуск автоочистки при старте
+        if self.enabled and self.channel_id and self.not_subscribed_msgs:
+            asyncio.create_task(self.auto_clean_subscribed_users())
 
     async def check_subscription(self, user_id):
         """Проверка подписки пользователя на канал"""
@@ -70,16 +163,52 @@ class SubCheckBot(loader.Module):
             return False
         
         try:
-            participants = await self.client.get_participants(self.channel_id, limit=10000)
-            return any(participant.id == user_id for participant in participants)
+            # Обновляем статистику
+            self.stats_counters["messages_checked"] = self.stats_counters.get("messages_checked", 0) + 1
+            self.config["stats_counters"] = self.stats_counters
+            
+            # Получаем сущность канала
+            try:
+                channel = await self.client.get_entity(self.channel_id)
+            except Exception as e:
+                print(f"Ошибка получения канала: {e}")
+                return False
+            
+            # Проверяем подписку
+            try:
+                # Пробуем получить информацию о пользователе в канале
+                await self.client.get_permissions(channel, user_id)
+                return True
+            except ValueError:
+                # Пользователь не найден в канале
+                return False
+            except Exception as e:
+                # Другие ошибки - проверяем через участников
+                print(f"Ошибка проверки через permissions: {e}")
+                
+                # Альтернативный метод через участников
+                try:
+                    participants = await self.client.get_participants(channel, limit=100)
+                    for participant in participants:
+                        if participant.id == user_id:
+                            self.stats_counters["subscriptions_verified"] = self.stats_counters.get("subscriptions_verified", 0) + 1
+                            self.config["stats_counters"] = self.stats_counters
+                            return True
+                except Exception as e2:
+                    print(f"Ошибка проверки через участников: {e2}")
+                    
         except Exception as e:
             print(f"Ошибка проверки подписки: {e}")
-            return False
+            
+        return False
 
     def is_bot(self, user):
         """Проверка, является ли пользователь ботом"""
-        if isinstance(user, User):
-            return user.bot
+        if hasattr(user, 'bot'):
+            if user.bot:
+                self.stats_counters["bots_detected"] = self.stats_counters.get("bots_detected", 0) + 1
+                self.config["stats_counters"] = self.stats_counters
+                return True
         return False
 
     def is_whitelisted(self, user_id):
@@ -94,42 +223,76 @@ class SubCheckBot(loader.Module):
             'added_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'user_id': user_id
         }
-        self.db.set("SubChecker", "whitelist", self.whitelist)
+        self.config["whitelist"] = self.whitelist
+        return True
 
     def remove_from_whitelist(self, user_id):
         """Удаление пользователя из белого списка"""
         if str(user_id) in self.whitelist:
             del self.whitelist[str(user_id)]
-            self.db.set("SubChecker", "whitelist", self.whitelist)
+            self.config["whitelist"] = self.whitelist
             return True
         return False
 
     async def save_not_subscribed_msg(self, user_id, message_id):
         """Сохранение ID сообщения о неподписке"""
-        self.not_subscribed_msgs[str(user_id)] = message_id
-        self.db.set("SubChecker", "not_subscribed_msgs", self.not_subscribed_msgs)
+        self.not_subscribed_msgs[str(user_id)] = {
+            'message_id': message_id,
+            'timestamp': time.time()
+        }
+        self.config["not_subscribed_msgs"] = self.not_subscribed_msgs
 
     async def delete_not_subscribed_msg(self, user_id):
         """Удаление сообщения о неподписке"""
         if str(user_id) in self.not_subscribed_msgs:
             try:
-                await self.client.delete_messages(user_id, self.not_subscribed_msgs[str(user_id)])
+                msg_data = self.not_subscribed_msgs[str(user_id)]
+                await self.client.delete_messages(user_id, msg_data['message_id'])
+                self.stats_counters["messages_deleted"] = self.stats_counters.get("messages_deleted", 0) + 1
+                self.config["stats_counters"] = self.stats_counters
             except:
                 pass
-            del self.not_subscribed_msgs[str(user_id)]
-            self.db.set("SubChecker", "not_subscribed_msgs", self.not_subscribed_msgs)
+            finally:
+                del self.not_subscribed_msgs[str(user_id)]
+                self.config["not_subscribed_msgs"] = self.not_subscribed_msgs
+            return True
+        return False
 
     async def pin_message(self, user_id, message_id):
-        """Закрепление сообщения"""
+        """Закрепление сообщения с удалением системного уведомления"""
         if self.pin_enabled:
             try:
+                # Задержка перед закреплением
+                await asyncio.sleep(0.5)
+                
+                # Закрепляем сообщение без уведомления
                 await self.client(UpdatePinnedMessageRequest(
                     peer=user_id,
                     id=message_id,
                     silent=True,
                     unpin=False
                 ))
+                
+                # Удаляем системное уведомление о закреплении
+                if self.delete_system_notifications:
+                    await asyncio.sleep(1)
+                    try:
+                        # Ищем системное сообщение о закреплении
+                        messages = await self.client.get_messages(user_id, limit=10)
+                        
+                        for msg in messages:
+                            # Проверяем, является ли сообщение системным уведомлением
+                            if msg.action:
+                                # Удаляем любое системное сообщение
+                                await msg.delete()
+                                break
+                    except Exception as e:
+                        print(f"Не удалось удалить системное уведомление: {e}")
+                
                 print(f"Сообщение {message_id} закреплено для пользователя {user_id}")
+                
+            except ChatAdminRequiredError:
+                print(f"Нет прав для закрепления сообщений у пользователя {user_id}")
             except Exception as e:
                 print(f"Ошибка при закреплении сообщения: {e}")
 
@@ -149,13 +312,44 @@ class SubCheckBot(loader.Module):
         
         return self.strings['not_subscribed'].format(channel_link=channel_display)
 
+    async def auto_clean_subscribed_users(self):
+        """Автоматическая очистка сообщений у подписавшихся пользователей"""
+        try:
+            cleaned_count = 0
+            users_to_clean = []
+            
+            # Собираем пользователей для проверки
+            for user_id_str in list(self.not_subscribed_msgs.keys()):
+                try:
+                    user_id = int(user_id_str)
+                    # Проверяем подписку
+                    if await self.check_subscription(user_id):
+                        users_to_clean.append(user_id)
+                except:
+                    continue
+            
+            # Удаляем сообщения у подписавшихся пользователей
+            for user_id in users_to_clean:
+                if await self.delete_not_subscribed_msg(user_id):
+                    cleaned_count += 1
+                await asyncio.sleep(0.1)  # Задержка между операциями
+            
+            if cleaned_count > 0:
+                print(f"Автоочистка: удалено {cleaned_count} сообщений")
+            
+            # Обновляем время последней очистки
+            self.last_auto_clean = int(time.time())
+            self.config["last_auto_clean"] = self.last_auto_clean
+            
+        except Exception as e:
+            print(f"Ошибка при автоочистке: {e}")
+
     @loader.command()
     async def subwl(self, message):
         """Управление белым списком"""
         args = utils.get_args_raw(message)
         
         if not args:
-            # Показать статус белого списка
             total_users = len(self.whitelist)
             status = f"<b>Белый список:</b> {total_users} пользователей\n\n"
             status += "<b>Команды:</b>\n"
@@ -171,54 +365,46 @@ class SubCheckBot(loader.Module):
         command = parts[0].lower()
         
         if command == "add":
-            if len(parts) < 2:
-                await utils.answer(message, "<b>Используйте:</b> .subwl add [ID]\n<b>Или ответьте на сообщение пользователя:</b> .subwl add")
-                return
-            
-            # Проверка, есть ли reply
             if message.is_reply:
                 reply = await message.get_reply_message()
                 user = await reply.get_sender()
                 user_id = user.id
-            else:
+            elif len(parts) > 1:
                 try:
                     user_id = int(parts[1])
                 except ValueError:
                     await utils.answer(message, self.strings['invalid_user_id'])
                     return
+            else:
+                await utils.answer(message, self.strings['no_reply'])
+                return
             
-            # Проверка, не в белом списке ли уже
             if self.is_whitelisted(user_id):
                 await utils.answer(message, f"<b>Пользователь уже в белом списке!</b>\n\nID: <code>{user_id}</code>")
                 return
             
-            # Добавление в белый список
             self.add_to_whitelist(user_id, message.sender_id)
             await utils.answer(message, self.strings['whitelist_added'].format(user_id))
             
-            # Если у пользователя было сообщение о подписке, удаляем его
             if str(user_id) in self.not_subscribed_msgs:
                 await self.delete_not_subscribed_msg(user_id)
                 await message.respond(f"<b>Пользователь добавлен в белый список и разблокирован!</b>\n\nID: <code>{user_id}</code>")
         
         elif command == "remove":
-            if len(parts) < 2:
-                await utils.answer(message, "<b>Используйте:</b> .subwl remove [ID]\n<b>Или ответьте на сообщение пользователя:</b> .subwl remove")
-                return
-            
-            # Проверка, есть ли reply
             if message.is_reply:
                 reply = await message.get_reply_message()
                 user = await reply.get_sender()
                 user_id = user.id
-            else:
+            elif len(parts) > 1:
                 try:
                     user_id = int(parts[1])
                 except ValueError:
                     await utils.answer(message, self.strings['invalid_user_id'])
                     return
+            else:
+                await utils.answer(message, self.strings['no_reply'])
+                return
             
-            # Удаление из белого списка
             if self.remove_from_whitelist(user_id):
                 await utils.answer(message, self.strings['whitelist_removed'].format(user_id))
             else:
@@ -229,7 +415,7 @@ class SubCheckBot(loader.Module):
                 await utils.answer(message, self.strings['whitelist_empty'])
                 return
             
-            text = "<b>Белый список пользователей:</b>\n\n"
+            text = ""
             count = 0
             
             for user_id_str, data in self.whitelist.items():
@@ -238,7 +424,6 @@ class SubCheckBot(loader.Module):
                     user_info = f"<b>ID:</b> <code>{user_id}</code>\n"
                     user_info += f"<b>Добавлен:</b> {data.get('added_at', 'Неизвестно')}\n"
                     
-                    # Попробуем получить имя пользователя
                     try:
                         user = await self.client.get_entity(user_id)
                         name = f"{user.first_name or ''} {user.last_name or ''}".strip() or user.username or "Неизвестно"
@@ -249,12 +434,11 @@ class SubCheckBot(loader.Module):
                     text += user_info + "─" * 20 + "\n"
                     count += 1
                     
-                    # Ограничим вывод чтобы не превысить лимит сообщения
                     if count >= 20:
                         text += f"\n<b>И еще:</b> {len(self.whitelist) - count} пользователей..."
                         break
                         
-                except Exception as e:
+                except:
                     continue
             
             text = self.strings['whitelist_list'].format(f"Всего: {len(self.whitelist)}\n\n") + text
@@ -263,27 +447,24 @@ class SubCheckBot(loader.Module):
         elif command == "clear":
             count = len(self.whitelist)
             self.whitelist = {}
-            self.db.set("SubChecker", "whitelist", self.whitelist)
+            self.config["whitelist"] = self.whitelist
             await utils.answer(message, self.strings['whitelist_cleared'].format(count))
         
         elif command == "check":
-            if len(parts) < 2:
-                await utils.answer(message, "<b>Используйте:</b> .subwl check [ID]\n<b>Или ответьте на сообщение пользователя:</b> .subwl check")
-                return
-            
-            # Проверка, есть ли reply
             if message.is_reply:
                 reply = await message.get_reply_message()
                 user = await reply.get_sender()
                 user_id = user.id
-            else:
+            elif len(parts) > 1:
                 try:
                     user_id = int(parts[1])
                 except ValueError:
                     await utils.answer(message, self.strings['invalid_user_id'])
                     return
+            else:
+                await utils.answer(message, self.strings['no_reply'])
+                return
             
-            # Проверка наличия в белом списке
             if self.is_whitelisted(user_id):
                 data = self.whitelist[str(user_id)]
                 await utils.answer(message, self.strings['user_in_whitelist'].format(
@@ -303,13 +484,11 @@ class SubCheckBot(loader.Module):
         
         if args.lower() == "on":
             self.pin_enabled = True
-            self.db.set("SubChecker", "pin_enabled", True)
-            status_text = "Включен"
+            self.config["pin_enabled"] = True
             await utils.answer(message, self.strings['pinned_enabled'])
         elif args.lower() == "off":
             self.pin_enabled = False
-            self.db.set("SubChecker", "pin_enabled", False)
-            status_text = "Выключен"
+            self.config["pin_enabled"] = False
             await utils.answer(message, self.strings['pinned_disabled'])
         else:
             status_text = "Включен" if self.pin_enabled else "Выключен"
@@ -317,7 +496,7 @@ class SubCheckBot(loader.Module):
 
     @loader.command()
     async def submessage(self, message):
-        """Кастомное сообщение, используйте {channel_link} """
+        """Кастомное сообщение, используйте {channel_link}"""
         args = utils.get_args_raw(message)
         
         if not args:
@@ -330,7 +509,7 @@ class SubCheckBot(loader.Module):
             return
         
         self.custom_message = args
-        self.db.set("SubChecker", "custom_message", self.custom_message)
+        self.config["custom_message"] = self.custom_message
         
         await utils.answer(message, self.strings['custom_message_set'])
     
@@ -338,7 +517,7 @@ class SubCheckBot(loader.Module):
     async def submessageclear(self, message):
         """Сбросить кастомное сообщение"""
         self.custom_message = ""
-        self.db.set("SubChecker", "custom_message", self.custom_message)
+        self.config["custom_message"] = self.custom_message
         
         await utils.answer(message, self.strings['custom_message_cleared'])
 
@@ -363,14 +542,15 @@ class SubCheckBot(loader.Module):
                 )
             return
         
+        # Очистка ввода
         if args.startswith('@'):
             args = args[1:]
         
         if 't.me/' in args:
-            if args.startswith('https://'):
-                args = args.replace('https://t.me/', '')
-            elif args.startswith('t.me/'):
-                args = args.replace('t.me/', '')
+            args = re.sub(r'https?://t\.me/', '', args)
+            args = re.sub(r'^t\.me/', '', args)
+        
+        args = args.strip('/')
         
         try:
             channel = await self.client.get_entity(args)
@@ -383,9 +563,9 @@ class SubCheckBot(loader.Module):
             else:
                 self.channel_link = f"tg://resolve?domain={args}"
             
-            self.db.set("SubChecker", "channel_username", self.channel_username)
-            self.db.set("SubChecker", "channel_link", self.channel_link)
-            self.db.set("SubChecker", "channel_id", self.channel_id)
+            self.config["channel_username"] = self.channel_username
+            self.config["channel_link"] = self.channel_link
+            self.config["channel_id"] = self.channel_id
             
             channel_display = f"@{channel.username}" if hasattr(channel, 'username') and channel.username else args
             channel_info = f"<a href='{self.channel_link}'>{channel_display}</a>"
@@ -408,7 +588,6 @@ class SubCheckBot(loader.Module):
         
         try:
             channel = await self.client.get_entity(self.channel_id)
-            participants = await self.client.get_participants(self.channel_id, limit=1)
             
             channel_info = []
             if hasattr(channel, 'title'):
@@ -416,7 +595,13 @@ class SubCheckBot(loader.Module):
             if hasattr(channel, 'username'):
                 channel_info.append(f"<b>Юзернейм:</b> @{channel.username}")
             channel_info.append(f"<b>ID:</b> <code>{channel.id}</code>")
-            channel_info.append(f"<b>Участников:</b> {channel.participants_count if hasattr(channel, 'participants_count') else 'N/A'}")
+            
+            # Пробуем получить количество участников
+            try:
+                count = await self.client.get_participants(channel, limit=1)
+                channel_info.append(f"<b>Доступ к участникам:</b> ✅")
+            except:
+                channel_info.append(f"<b>Доступ к участникам:</b> ❌ (возможно, нет прав)")
             
             await utils.answer(message, 
                 self.strings['test_success'] + "\n\n" + "\n".join(channel_info)
@@ -424,7 +609,7 @@ class SubCheckBot(loader.Module):
             
         except Exception as e:
             error_msg = str(e)
-            if "CHANNEL_PRIVATE" in error_msg or "аналог is private" in error_msg:
+            if "CHANNEL_PRIVATE" in error_msg or "private" in error_msg.lower():
                 error_msg = self.strings['no_permission']
             
             await utils.answer(message, 
@@ -436,17 +621,15 @@ class SubCheckBot(loader.Module):
         """Включить/выключить проверку подписки"""
         args = utils.get_args_raw(message)
         
-        enabled = self.db.get("SubChecker", "enabled", True)
-        
         if args.lower() == "on":
             if not self.channel_id:
                 await utils.answer(message, self.strings['channel_not_set'])
                 return
                 
-            self.db.set("SubChecker", "enabled", True)
+            self.config["enabled"] = True
             self.enabled = True
         elif args.lower() == "off":
-            self.db.set("SubChecker", "enabled", False)
+            self.config["enabled"] = False
             self.enabled = False
         
         status_text = "Включена" if self.enabled else "Выключена"
@@ -469,69 +652,126 @@ class SubCheckBot(loader.Module):
         response += ".submessage текст - кастомное сообщение\n"
         response += ".subpin on/off - закреп сообщений\n"
         response += ".subwl - управление белым списком\n"
+        response += ".substats - статистика\n"
+        response += ".subautoclean - автоочистка\n"
         
         await utils.answer(message, response)
+
+    @loader.command()
+    async def substats(self, message):
+        """Статистика работы модуля"""
+        stats_info = []
+        
+        # Основная статистика
+        stats_info.append(f"<b>Сообщений проверено:</b> {self.stats_counters.get('messages_checked', 0)}")
+        stats_info.append(f"<b>Подписок проверено:</b> {self.stats_counters.get('subscriptions_verified', 0)}")
+        stats_info.append(f"<b>Ботов обнаружено:</b> {self.stats_counters.get('bots_detected', 0)}")
+        stats_info.append(f"<b>Сообщений отправлено:</b> {self.stats_counters.get('messages_sent', 0)}")
+        stats_info.append(f"<b>Сообщений удалено:</b> {self.stats_counters.get('messages_deleted', 0)}")
+        
+        # Текущее состояние
+        stats_info.append(f"\n<b>Текущее состояние:</b>")
+        stats_info.append(f"<b>Активных сообщений:</b> {len(self.not_subscribed_msgs)}")
+        stats_info.append(f"<b>В белом списке:</b> {len(self.whitelist)}")
+        stats_info.append(f"<b>Модуль включен:</b> {'Да' if self.enabled else 'Нет'}")
+        
+        # Информация о канале
+        if self.channel_username:
+            stats_info.append(f"\n<b>Канал:</b> {self.channel_username}")
+        if self.last_auto_clean > 0:
+            from datetime import datetime
+            last_clean = datetime.fromtimestamp(self.last_auto_clean).strftime('%Y-%m-%d %H:%M:%S')
+            stats_info.append(f"<b>Последняя автоочистка:</b> {last_clean}")
+        
+        stats_text = "\n".join(stats_info)
+        await utils.answer(message, self.strings['stats'].format(stats_info=stats_text))
+
+    @loader.command()
+    async def subautoclean(self, message):
+        """Запустить автоочистку сообщений у подписавшихся пользователей"""
+        if not self.channel_id:
+            await utils.answer(message, self.strings['channel_not_set'])
+            return
+        
+        if not self.not_subscribed_msgs:
+            await utils.answer(message, "<b>Нет сообщений для очистки!</b>")
+            return
+        
+        await utils.answer(message, self.strings['auto_clean_started'])
+        
+        cleaned_count = 0
+        total_count = len(self.not_subscribed_msgs)
+        
+        for user_id_str in list(self.not_subscribed_msgs.keys()):
+            try:
+                user_id = int(user_id_str)
+                if await self.check_subscription(user_id):
+                    if await self.delete_not_subscribed_msg(user_id):
+                        cleaned_count += 1
+                    await asyncio.sleep(0.1)
+            except:
+                continue
+        
+        self.last_auto_clean = int(time.time())
+        self.config["last_auto_clean"] = self.last_auto_clean
+        
+        await utils.answer(message, 
+            self.strings['auto_clean_finished'].format(
+                cleaned_count=cleaned_count,
+                total_count=total_count
+            )
+        )
 
     async def watcher(self, message):
         """Обработчик входящих сообщений"""
         
-        # Проверка включен ли модуль
-        if not self.enabled:
+        if not self.enabled or not self.channel_id:
             return
         
-        # Проверка настроен ли канал
-        if not self.channel_id:
-            print("Канал не настроен")
-            return
-            
-        # Проверка что сообщение в личке
-        if not message.is_private:
+        if not message.is_private or message.out:
             return
         
-        # Проверка что сообщение не исходящее
-        if message.out:
-            return
-        
-        # Получение информации об отправителе
         try:
             user = await message.get_sender()
         except:
-            print("Не удалось получить информацию об отправителе")
-            return
-        
-        # Проверка что отправитель не бот
-        if self.is_bot(user):
-            print(f"Сообщение от бота {user.id}, игнорируем")
             return
         
         user_id = user.id
         
+        # Проверка на бота
+        if self.is_bot(user):
+            print(f"Бот {user_id} заблокирован")
+            return
+        
         # Проверка белого списка
         if self.is_whitelisted(user_id):
-            print(f"Пользователь {user_id} в белом списке, проверка подписки пропускается")
             return
         
         # Проверка подписки
         is_subscribed = await self.check_subscription(user_id)
         
-        # Если подписан
         if is_subscribed:
             if str(user_id) in self.not_subscribed_msgs:
-                print(f"Пользователь {user_id} подписался, удаляем сообщение с просьбой подписаться")
                 await self.delete_not_subscribed_msg(user_id)
                 await message.respond(self.strings['subscribed'])
             return
         
         # Если не подписан
-        print(f"Пользователь {user_id} не подписан, удаляем сообщение")
-        
         if str(user_id) not in self.not_subscribed_msgs:
             message_text = self.get_not_subscribed_message()
             sent_msg = await message.respond(message_text)
+            
+            # Обновляем статистику
+            self.stats_counters["messages_sent"] = self.stats_counters.get("messages_sent", 0) + 1
+            self.config["stats_counters"] = self.stats_counters
+            
             await self.pin_message(user_id, sent_msg.id)
             await self.save_not_subscribed_msg(user_id, sent_msg.id)
         
-        await message.delete()
+        try:
+            await message.delete()
+        except:
+            pass
 
     @loader.command()
     async def sublist(self, message):
@@ -542,40 +782,58 @@ class SubCheckBot(loader.Module):
         
         text = "<b>Пользователи с сообщениями о подписке:</b>\n\n"
         count = 0
-        for user_id_str in self.not_subscribed_msgs:
+        for user_id_str, msg_data in self.not_subscribed_msgs.items():
             user_id = int(user_id_str)
             try:
                 user = await self.client.get_entity(user_id)
                 name = f"{user.first_name or ''} {user.last_name or ''}".strip() or user.username or str(user_id)
                 
                 is_subscribed = await self.check_subscription(user_id)
-                sub_status = "Подписан" if is_subscribed else "Не подписан"
-                whitelist_status = "В белом списке" if self.is_whitelisted(user_id) else "Не в белом списке"
+                sub_status = "✅ Подписан" if is_subscribed else "❌ Не подписан"
+                whitelist_status = "✅ В белом списке" if self.is_whitelisted(user_id) else "❌ Не в белом списке"
                 
-                text += f"{name} (ID: {user_id})\nСтатус: {sub_status}, {whitelist_status}\n"
+                # Время отправки сообщения
+                timestamp = msg_data.get('timestamp', 0)
+                if timestamp > 0:
+                    from datetime import datetime
+                    time_str = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    time_str = "Неизвестно"
+                
+                text += f"👤 <b>{name}</b> (ID: {user_id})\n"
+                text += f"📊 Статус: {sub_status}\n"
+                text += f"📝 Белый список: {whitelist_status}\n"
+                text += f"🕒 Сообщение отправлено: {time_str}\n"
+                text += "─" * 30 + "\n"
                 count += 1
+                
+                if count >= 10:  # Ограничим вывод
+                    text += f"\n<b>И еще:</b> {len(self.not_subscribed_msgs) - count} пользователей..."
+                    break
+                    
             except:
-                text += f"ID: {user_id}\n"
+                text += f"👤 ID: {user_id}\n"
                 count += 1
         
-        text += f"\n<b>Всего:</b> {count}\n\n"
-        text += f"Сообщения автоматически удаляются после подписки на канал"
+        text += f"\n<b>Всего пользователей:</b> {len(self.not_subscribed_msgs)}"
         
         await utils.answer(message, text)
 
     @loader.command()
     async def subclean(self, message):
         """Очистить все сообщения о подписке"""
+        if not self.not_subscribed_msgs:
+            await utils.answer(message, "Нет сообщений для очистки")
+            return
+        
         count = 0
         for user_id_str in list(self.not_subscribed_msgs.keys()):
-            user_id = int(user_id_str)
             try:
-                await self.client.delete_messages(user_id, self.not_subscribed_msgs[user_id_str])
-                count += 1
+                user_id = int(user_id_str)
+                if await self.delete_not_subscribed_msg(user_id):
+                    count += 1
+                await asyncio.sleep(0.1)
             except:
                 pass
-        
-        self.not_subscribed_msgs = {}
-        self.db.set("SubChecker", "not_subscribed_msgs", self.not_subscribed_msgs)
         
         await utils.answer(message, f"<b>Удалено {count} сообщений о подписке</b>")
