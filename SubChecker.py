@@ -378,7 +378,7 @@ class SubCheckBot(loader.Module):
 
     @loader.command()
     async def submessage(self, message):
-        """Установить кастомное сообщение для проверки подписки"""
+        """Установить кастомное сообщение используйте {channel_link}"""
         args = utils.get_args_raw(message)
         
         if not args:
