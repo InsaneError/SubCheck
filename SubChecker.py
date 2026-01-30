@@ -1,8 +1,6 @@
-from telethon import events, Button
-from telethon.tl.functions.contacts import BlockRequest, UnblockRequest
-from telethon.tl.functions.messages import ReportSpamRequest
-from telethon.tl.types import User
-from telethon.tl.functions.messages import UpdatePinnedMessageRequest
+from telethon import events
+from collections import defaultdict
+import time
 from .. import loader, utils
 
 @loader.tds
@@ -20,14 +18,10 @@ class SubCheckBot(loader.Module):
         'test_success': "<b>Тест пройден успешно!</b>\n\nБот может получить информацию о канале и его участниках.",
         'test_failed': "<b>Тест не пройден!</b>\n\nОшибка: {}",
         'no_permission': "<b>Нет прав доступа!</b>\n\nУбедитесь, что бот является администратором канала или имеет права на просмотр участников.",
-        'bot_detected': "<b>Бот обнаружен!</b>\n\nБоты не проходят проверку подписки.",
         'custom_message_set': "<b>Кастомное сообщение установлено!</b>",
         'custom_message_cleared': "<b>Кастомное сообщение сброшено!</b>",
         'current_custom_message': "<b>Текущее кастомное сообщение:</b>\n\n{}",
         'no_custom_message': "<b>Кастомное сообщение не установлено.</b>\nИспользуется стандартное сообщение.",
-        'pinned_enabled': "<b>Закреп сообщений включен!</b>\nСообщения с просьбой подписаться будут закрепляться.",
-        'pinned_disabled': "<b>Закреп сообщений отключен!</b>\nСообщения с просьбой подписаться не будут закрепляться.",
-        'pinned_status': "<b>Статус закрепа сообщений:</b> {}",
         'whitelist_added': "<b>Пользователь добавлен в белый список!</b>\n\nID: <code>{}</code>",
         'whitelist_removed': "<b>Пользователь удален из белого списка!</b>\n\nID: <code>{}</code>",
         'whitelist_not_found': "<b>Пользователь не найден в белом списке!</b>",
@@ -44,94 +38,88 @@ class SubCheckBot(loader.Module):
         self.client = client
         self.db = db
         
-        # Загрузка настроек канала
+        # Кэш для быстрого доступа
+        self._cache = {
+            'channel_id': None,
+            'whitelist': set(),
+            'pending_users': set(),  # Пользователи, которым уже отправлено сообщение
+            'last_check': {}  # Время последней проверки для каждого пользователя
+        }
+        
+        # Загрузка настроек
         self.channel_username = self.db.get("SubChecker", "channel_username", "")
         self.channel_link = self.db.get("SubChecker", "channel_link", "")
-        self.channel_id = self.db.get("SubChecker", "channel_id", None)
+        self.channel_id = self.db.get("SubChecker", "channel_id")
         
-        # Загрузка сообщений о неподписке
-        self.not_subscribed_msgs = self.db.get("SubChecker", "not_subscribed_msgs", {})
+        # Кэшируем ID канала
+        if self.channel_id:
+            self._cache['channel_id'] = self.channel_id
         
         # Загрузка кастомного сообщения
         self.custom_message = self.db.get("SubChecker", "custom_message", "")
         
-        # Загрузка настройки закрепа
-        self.pin_enabled = self.db.get("SubChecker", "pin_enabled", True)
-        
         # Загрузка белого списка
-        self.whitelist = self.db.get("SubChecker", "whitelist", {})
+        whitelist_data = self.db.get("SubChecker", "whitelist", {})
+        self._cache['whitelist'] = set(str(uid) for uid in whitelist_data.keys())
         
         # Включение/выключение модуля
         self.enabled = self.db.get("SubChecker", "enabled", True)
+        
+        # Флаг для предотвращения дублирования
+        self._processing = defaultdict(bool)
 
     async def check_subscription(self, user_id):
-        """Проверка подписки пользователя на канал"""
-        if not self.channel_id:
+        """Проверка подписки пользователя на канал с кэшированием"""
+        if not self._cache['channel_id']:
             return False
         
+        # Проверяем кэш (5 минут)
+        cache_key = f"sub_{user_id}"
+        if cache_key in self._cache['last_check']:
+            if time.time() - self._cache['last_check'][cache_key] < 300:  # 5 минут
+                return True
+        
         try:
-            participants = await self.client.get_participants(self.channel_id, limit=10000)
-            return any(participant.id == user_id for participant in participants)
-        except Exception as e:
-            print(f"Ошибка проверки подписки: {e}")
+            # Используем более быстрый метод проверки
+            async for participant in self.client.iter_participants(
+                self._cache['channel_id'], 
+                limit=1, 
+                filter=User(id=user_id)
+            ):
+                self._cache['last_check'][cache_key] = time.time()
+                return True
+            return False
+        except Exception:
             return False
 
-    def is_bot(self, user):
-        """Проверка, является ли пользователь ботом"""
-        if isinstance(user, User):
-            return user.bot
-        return False
-
     def is_whitelisted(self, user_id):
-        """Проверка, находится ли пользователь в белом списке"""
-        return str(user_id) in self.whitelist
+        """Быстрая проверка белого списка через set"""
+        return str(user_id) in self._cache['whitelist']
 
-    def add_to_whitelist(self, user_id, added_by=None):
+    def add_to_whitelist(self, user_id):
         """Добавление пользователя в белый список"""
-        from datetime import datetime
-        self.whitelist[str(user_id)] = {
-            'added_by': added_by,
-            'added_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'user_id': user_id
-        }
-        self.db.set("SubChecker", "whitelist", self.whitelist)
+        user_str = str(user_id)
+        if user_str not in self._cache['whitelist']:
+            self._cache['whitelist'].add(user_str)
+            # Сохраняем в базу
+            whitelist_data = self.db.get("SubChecker", "whitelist", {})
+            whitelist_data[user_str] = {
+                'added_at': time.strftime("%Y-%m-%d %H:%M:%S"),
+                'user_id': user_id
+            }
+            self.db.set("SubChecker", "whitelist", whitelist_data)
 
     def remove_from_whitelist(self, user_id):
         """Удаление пользователя из белого списка"""
-        if str(user_id) in self.whitelist:
-            del self.whitelist[str(user_id)]
-            self.db.set("SubChecker", "whitelist", self.whitelist)
+        user_str = str(user_id)
+        if user_str in self._cache['whitelist']:
+            self._cache['whitelist'].remove(user_str)
+            # Удаляем из базы
+            whitelist_data = self.db.get("SubChecker", "whitelist", {})
+            whitelist_data.pop(user_str, None)
+            self.db.set("SubChecker", "whitelist", whitelist_data)
             return True
         return False
-
-    async def save_not_subscribed_msg(self, user_id, message_id):
-        """Сохранение ID сообщения о неподписке"""
-        self.not_subscribed_msgs[str(user_id)] = message_id
-        self.db.set("SubChecker", "not_subscribed_msgs", self.not_subscribed_msgs)
-
-    async def delete_not_subscribed_msg(self, user_id):
-        """Удаление сообщения о неподписке"""
-        if str(user_id) in self.not_subscribed_msgs:
-            try:
-                await self.client.delete_messages(user_id, self.not_subscribed_msgs[str(user_id)])
-            except:
-                pass
-            del self.not_subscribed_msgs[str(user_id)]
-            self.db.set("SubChecker", "not_subscribed_msgs", self.not_subscribed_msgs)
-
-    async def pin_message(self, user_id, message_id):
-        """Закрепление сообщения"""
-        if self.pin_enabled:
-            try:
-                await self.client(UpdatePinnedMessageRequest(
-                    peer=user_id,
-                    id=message_id,
-                    silent=True,
-                    unpin=False
-                ))
-                print(f"Сообщение {message_id} закреплено для пользователя {user_id}")
-            except Exception as e:
-                print(f"Ошибка при закреплении сообщения: {e}")
 
     def get_not_subscribed_message(self):
         """Получение сообщения о неподписке"""
@@ -155,8 +143,7 @@ class SubCheckBot(loader.Module):
         args = utils.get_args_raw(message)
         
         if not args:
-            # Показать статус белого списка
-            total_users = len(self.whitelist)
+            total_users = len(self._cache['whitelist'])
             status = f"<b>Белый список:</b> {total_users} пользователей\n\n"
             status += "<b>Команды:</b>\n"
             status += ".subwl add [ID] - добавить пользователя\n"
@@ -171,121 +158,101 @@ class SubCheckBot(loader.Module):
         command = parts[0].lower()
         
         if command == "add":
-            if len(parts) < 2:
-                await utils.answer(message, "<b>Используйте:</b> .subwl add [ID]\n<b>Или ответьте на сообщение пользователя:</b> .subwl add")
-                return
+            user_id = None
             
-            # Проверка, есть ли reply
             if message.is_reply:
                 reply = await message.get_reply_message()
                 user = await reply.get_sender()
                 user_id = user.id
-            else:
+            elif len(parts) > 1:
                 try:
                     user_id = int(parts[1])
                 except ValueError:
                     await utils.answer(message, self.strings['invalid_user_id'])
                     return
-            
-            # Проверка, не в белом списке ли уже
-            if self.is_whitelisted(user_id):
-                await utils.answer(message, f"<b>Пользователь уже в белом списке!</b>\n\nID: <code>{user_id}</code>")
+            else:
+                await utils.answer(message, "<b>Используйте:</b> .subwl add [ID]\n<b>Или ответьте на сообщение</b>")
                 return
             
-            # Добавление в белый список
-            self.add_to_whitelist(user_id, message.sender_id)
+            if self.is_whitelisted(user_id):
+                await utils.answer(message, f"<b>Уже в белом списке!</b>\n\nID: <code>{user_id}</code>")
+                return
+            
+            self.add_to_whitelist(user_id)
             await utils.answer(message, self.strings['whitelist_added'].format(user_id))
             
-            # Если у пользователя было сообщение о подписке, удаляем его
-            if str(user_id) in self.not_subscribed_msgs:
-                await self.delete_not_subscribed_msg(user_id)
-                await message.respond(f"<b>Пользователь добавлен в белый список и разблокирован!</b>\n\nID: <code>{user_id}</code>")
+            # Удаляем из pending, если был там
+            self._cache['pending_users'].discard(str(user_id))
         
         elif command == "remove":
-            if len(parts) < 2:
-                await utils.answer(message, "<b>Используйте:</b> .subwl remove [ID]\n<b>Или ответьте на сообщение пользователя:</b> .subwl remove")
-                return
+            user_id = None
             
-            # Проверка, есть ли reply
             if message.is_reply:
                 reply = await message.get_reply_message()
                 user = await reply.get_sender()
                 user_id = user.id
-            else:
+            elif len(parts) > 1:
                 try:
                     user_id = int(parts[1])
                 except ValueError:
                     await utils.answer(message, self.strings['invalid_user_id'])
                     return
+            else:
+                await utils.answer(message, "<b>Используйте:</b> .subwl remove [ID]\n<b>Или ответьте на сообщение</b>")
+                return
             
-            # Удаление из белого списка
             if self.remove_from_whitelist(user_id):
                 await utils.answer(message, self.strings['whitelist_removed'].format(user_id))
             else:
                 await utils.answer(message, self.strings['whitelist_not_found'])
         
         elif command == "list":
-            if not self.whitelist:
+            if not self._cache['whitelist']:
                 await utils.answer(message, self.strings['whitelist_empty'])
                 return
             
-            text = "<b>Белый список пользователей:</b>\n\n"
-            count = 0
+            whitelist_data = self.db.get("SubChecker", "whitelist", {})
+            text = f"<b>Белый список:</b> {len(self._cache['whitelist'])} пользователей\n\n"
             
-            for user_id_str, data in self.whitelist.items():
-                try:
-                    user_id = int(user_id_str)
-                    user_info = f"<b>ID:</b> <code>{user_id}</code>\n"
-                    user_info += f"<b>Добавлен:</b> {data.get('added_at', 'Неизвестно')}\n"
-                    
-                    # Попробуем получить имя пользователя
-                    try:
-                        user = await self.client.get_entity(user_id)
-                        name = f"{user.first_name or ''} {user.last_name or ''}".strip() or user.username or "Неизвестно"
-                        user_info += f"<b>Имя:</b> {name}\n"
-                    except:
-                        user_info += f"<b>Имя:</b> Не удалось получить\n"
-                    
-                    text += user_info + "─" * 20 + "\n"
-                    count += 1
-                    
-                    # Ограничим вывод чтобы не превысить лимит сообщения
-                    if count >= 20:
-                        text += f"\n<b>И еще:</b> {len(self.whitelist) - count} пользователей..."
-                        break
-                        
-                except Exception as e:
-                    continue
+            for i, user_str in enumerate(list(self._cache['whitelist'])[:20], 1):
+                data = whitelist_data.get(user_str, {})
+                text += f"{i}. ID: <code>{user_str}</code>\n"
+                text += f"   Добавлен: {data.get('added_at', 'Неизвестно')}\n"
+                
+                if i < min(20, len(self._cache['whitelist'])):
+                    text += "   \n"
             
-            text = self.strings['whitelist_list'].format(f"Всего: {len(self.whitelist)}\n\n") + text
+            if len(self._cache['whitelist']) > 20:
+                text += f"\n<b>И еще:</b> {len(self._cache['whitelist']) - 20} пользователей..."
+            
             await utils.answer(message, text)
         
         elif command == "clear":
-            count = len(self.whitelist)
-            self.whitelist = {}
-            self.db.set("SubChecker", "whitelist", self.whitelist)
+            count = len(self._cache['whitelist'])
+            self._cache['whitelist'].clear()
+            self.db.set("SubChecker", "whitelist", {})
             await utils.answer(message, self.strings['whitelist_cleared'].format(count))
         
         elif command == "check":
-            if len(parts) < 2:
-                await utils.answer(message, "<b>Используйте:</b> .subwl check [ID]\n<b>Или ответьте на сообщение пользователя:</b> .subwl check")
-                return
+            user_id = None
             
-            # Проверка, есть ли reply
             if message.is_reply:
                 reply = await message.get_reply_message()
                 user = await reply.get_sender()
                 user_id = user.id
-            else:
+            elif len(parts) > 1:
                 try:
                     user_id = int(parts[1])
                 except ValueError:
                     await utils.answer(message, self.strings['invalid_user_id'])
                     return
+            else:
+                await utils.answer(message, "<b>Используйте:</b> .subwl check [ID]\n<b>Или ответьте на сообщение</b>")
+                return
             
-            # Проверка наличия в белом списке
             if self.is_whitelisted(user_id):
-                data = self.whitelist[str(user_id)]
+                whitelist_data = self.db.get("SubChecker", "whitelist", {})
+                data = whitelist_data.get(str(user_id), {})
                 await utils.answer(message, self.strings['user_in_whitelist'].format(
                     user_id, 
                     data.get('added_at', 'Неизвестно')
@@ -297,25 +264,6 @@ class SubCheckBot(loader.Module):
             await utils.answer(message, "<b>Неизвестная команда!</b>\n\nИспользуйте .subwl для списка команд")
 
     @loader.command()
-    async def subpin(self, message):
-        """Включить/выключить закреп сообщений"""
-        args = utils.get_args_raw(message)
-        
-        if args.lower() == "on":
-            self.pin_enabled = True
-            self.db.set("SubChecker", "pin_enabled", True)
-            status_text = "Включен"
-            await utils.answer(message, self.strings['pinned_enabled'])
-        elif args.lower() == "off":
-            self.pin_enabled = False
-            self.db.set("SubChecker", "pin_enabled", False)
-            status_text = "Выключен"
-            await utils.answer(message, self.strings['pinned_disabled'])
-        else:
-            status_text = "Включен" if self.pin_enabled else "Выключен"
-            await utils.answer(message, self.strings['pinned_status'].format(status_text))
-
-    @loader.command()
     async def submessage(self, message):
         """Кастомное сообщение, используйте {channel_link} """
         args = utils.get_args_raw(message)
@@ -324,14 +272,11 @@ class SubCheckBot(loader.Module):
             if not self.custom_message:
                 await utils.answer(message, self.strings['no_custom_message'])
             else:
-                await utils.answer(message, 
-                    self.strings['current_custom_message'].format(self.custom_message)
-                )
+                await utils.answer(message, self.strings['current_custom_message'].format(self.custom_message))
             return
         
         self.custom_message = args
         self.db.set("SubChecker", "custom_message", self.custom_message)
-        
         await utils.answer(message, self.strings['custom_message_set'])
     
     @loader.command()
@@ -339,7 +284,6 @@ class SubCheckBot(loader.Module):
         """Сбросить кастомное сообщение"""
         self.custom_message = ""
         self.db.set("SubChecker", "custom_message", self.custom_message)
-        
         await utils.answer(message, self.strings['custom_message_cleared'])
 
     @loader.command()
@@ -355,60 +299,57 @@ class SubCheckBot(loader.Module):
                 if self.channel_link:
                     channel_info = f"<a href='{self.channel_link}'>{channel_info}</a>"
                 
-                await utils.answer(message, 
-                    self.strings['current_channel'].format(
-                        channel_info, 
-                        self.channel_id if self.channel_id else "Не определен"
-                    )
-                )
+                await utils.answer(message, self.strings['current_channel'].format(
+                    channel_info, 
+                    self.channel_id if self.channel_id else "Не определен"
+                ))
             return
         
+        # Очистка аргументов
         if args.startswith('@'):
             args = args[1:]
         
         if 't.me/' in args:
-            if args.startswith('https://'):
-                args = args.replace('https://t.me/', '')
-            elif args.startswith('t.me/'):
-                args = args.replace('t.me/', '')
+            args = args.split('/')[-1]
         
         try:
-            channel = await self.client.get_entity(args)
+            entity = await self.client.get_entity(args)
             
-            self.channel_username = f"@{channel.username}" if hasattr(channel, 'username') and channel.username else args
-            self.channel_id = channel.id
+            if not hasattr(entity, 'broadcast') or not entity.broadcast:
+                await utils.answer(message, "<b>Это не канал!</b>\nУкажите канал для проверки подписки.")
+                return
             
-            if hasattr(channel, 'username') and channel.username:
-                self.channel_link = f"https://t.me/{channel.username}"
+            self.channel_username = f"@{entity.username}" if entity.username else args
+            self.channel_id = entity.id
+            self._cache['channel_id'] = entity.id
+            
+            if entity.username:
+                self.channel_link = f"https://t.me/{entity.username}"
             else:
-                self.channel_link = f"tg://resolve?domain={args}"
+                self.channel_link = f"tg://resolve?domain={entity.id}"
             
             self.db.set("SubChecker", "channel_username", self.channel_username)
             self.db.set("SubChecker", "channel_link", self.channel_link)
             self.db.set("SubChecker", "channel_id", self.channel_id)
             
-            channel_display = f"@{channel.username}" if hasattr(channel, 'username') and channel.username else args
+            channel_display = f"@{entity.username}" if entity.username else args
             channel_info = f"<a href='{self.channel_link}'>{channel_display}</a>"
             
-            await utils.answer(message, 
-                self.strings['channel_set'].format(channel_info)
-            )
+            await utils.answer(message, self.strings['channel_set'].format(channel_info))
             
         except Exception as e:
-            await utils.answer(message, 
-                self.strings['invalid_channel'] + f"\n\n<code>{str(e)}</code>"
-            )
+            await utils.answer(message, self.strings['invalid_channel'] + f"\n\n<code>{str(e)}</code>")
 
     @loader.command()
     async def subtest(self, message):
         """Протестировать доступ к каналу"""
-        if not self.channel_id:
+        if not self._cache['channel_id']:
             await utils.answer(message, self.strings['channel_not_set'])
             return
         
         try:
-            channel = await self.client.get_entity(self.channel_id)
-            participants = await self.client.get_participants(self.channel_id, limit=1)
+            channel = await self.client.get_entity(self._cache['channel_id'])
+            participants_count = channel.participants_count if hasattr(channel, 'participants_count') else 'N/A'
             
             channel_info = []
             if hasattr(channel, 'title'):
@@ -416,166 +357,136 @@ class SubCheckBot(loader.Module):
             if hasattr(channel, 'username'):
                 channel_info.append(f"<b>Юзернейм:</b> @{channel.username}")
             channel_info.append(f"<b>ID:</b> <code>{channel.id}</code>")
-            channel_info.append(f"<b>Участников:</b> {channel.participants_count if hasattr(channel, 'participants_count') else 'N/A'}")
+            channel_info.append(f"<b>Участников:</b> {participants_count}")
             
-            await utils.answer(message, 
-                self.strings['test_success'] + "\n\n" + "\n".join(channel_info)
-            )
+            await utils.answer(message, self.strings['test_success'] + "\n\n" + "\n".join(channel_info))
             
         except Exception as e:
             error_msg = str(e)
-            if "CHANNEL_PRIVATE" in error_msg or "аналог is private" in error_msg:
+            if any(x in error_msg.lower() for x in ['private', 'rights', 'access']):
                 error_msg = self.strings['no_permission']
             
-            await utils.answer(message, 
-                self.strings['test_failed'].format(error_msg)
-            )
+            await utils.answer(message, self.strings['test_failed'].format(error_msg))
 
     @loader.command()
     async def subcheck(self, message):
         """Включить/выключить проверку подписки"""
         args = utils.get_args_raw(message)
         
-        enabled = self.db.get("SubChecker", "enabled", True)
-        
         if args.lower() == "on":
-            if not self.channel_id:
+            if not self._cache['channel_id']:
                 await utils.answer(message, self.strings['channel_not_set'])
                 return
                 
             self.db.set("SubChecker", "enabled", True)
             self.enabled = True
+            status = "✅ Включена"
         elif args.lower() == "off":
             self.db.set("SubChecker", "enabled", False)
             self.enabled = False
+            status = "❌ Выключена"
+        else:
+            status = "✅ Включена" if self.enabled else "❌ Выключена"
         
-        status_text = "Включена" if self.enabled else "Выключена"
-        channel_status = "Настроен" if self.channel_id else "Не настроен"
-        pin_status = "Включен" if self.pin_enabled else "Выключен"
-        whitelist_status = f"{len(self.whitelist)} пользователей"
-        
-        response = "<b>Статус проверки подписки:</b>\n\n"
-        response += f"<b>Проверка:</b> {status_text}\n"
-        response += f"<b>Канал:</b> {channel_status}\n"
-        response += f"<b>Закреп сообщений:</b> {pin_status}\n"
-        response += f"<b>Белый список:</b> {whitelist_status}\n"
+        response = f"<b>Статус проверки подписки:</b> {status}\n\n"
         
         if self.channel_username:
-            response += f"<b>Текущий канал:</b> {self.channel_username}\n"
+            response += f"<b>Канал:</b> {self.channel_username}\n"
+        else:
+            response += "<b>Канал:</b> ❌ Не настроен\n"
+        
+        response += f"<b>Белый список:</b> {len(self._cache['whitelist'])} пользователей\n"
         
         response += "\n<b>Основные команды:</b>\n"
         response += ".subcheck on/off - вкл/выкл проверку\n"
         response += ".subchannel @юзернейм - установить канал\n"
         response += ".submessage текст - кастомное сообщение\n"
-        response += ".subpin on/off - закреп сообщений\n"
         response += ".subwl - управление белым списком\n"
         
         await utils.answer(message, response)
 
     async def watcher(self, message):
-        """Обработчик входящих сообщений"""
+        """Оптимизированный обработчик входящих сообщений"""
         
-        # Проверка включен ли модуль
-        if not self.enabled:
+        # Быстрые проверки
+        if not self.enabled or not self._cache['channel_id'] or not message.is_private or message.out:
             return
         
-        # Проверка настроен ли канал
-        if not self.channel_id:
-            print("Канал не настроен")
-            return
-            
-        # Проверка что сообщение в личке
-        if not message.is_private:
-            return
-        
-        # Проверка что сообщение не исходящее
-        if message.out:
-            return
-        
-        # Получение информации об отправителе
         try:
             user = await message.get_sender()
-        except:
-            print("Не удалось получить информацию об отправителе")
-            return
-        
-        # Проверка что отправитель не бот
-        if self.is_bot(user):
-            print(f"Сообщение от бота {user.id}, игнорируем")
-            return
-        
-        user_id = user.id
-        
-        # Проверка белого списка
-        if self.is_whitelisted(user_id):
-            print(f"Пользователь {user_id} в белом списке, проверка подписки пропускается")
-            return
-        
-        # Проверка подписки
-        is_subscribed = await self.check_subscription(user_id)
-        
-        # Если подписан
-        if is_subscribed:
-            if str(user_id) in self.not_subscribed_msgs:
-                print(f"Пользователь {user_id} подписался, удаляем сообщение с просьбой подписаться")
-                await self.delete_not_subscribed_msg(user_id)
-                await message.respond(self.strings['subscribed'])
-            return
-        
-        # Если не подписан
-        print(f"Пользователь {user_id} не подписан, удаляем сообщение")
-        
-        if str(user_id) not in self.not_subscribed_msgs:
+            user_id = user.id
+            user_str = str(user_id)
+            
+            # Проверка на бота
+            if hasattr(user, 'bot') and user.bot:
+                return
+            
+            # Проверка флага обработки (предотвращение дублирования)
+            if self._processing[user_str]:
+                return
+            self._processing[user_str] = True
+            
+            # Проверка белого списка
+            if self.is_whitelisted(user_id):
+                self._processing[user_str] = False
+                return
+            
+            # Проверяем, не отправляли ли уже сообщение
+            if user_str in self._cache['pending_users']:
+                # Проверяем подписку
+                if await self.check_subscription(user_id):
+                    # Пользователь подписался
+                    self._cache['pending_users'].discard(user_str)
+                    await message.respond(self.strings['subscribed'])
+                    await message.delete()
+                self._processing[user_str] = False
+                return
+            
+            # Первое сообщение - проверяем подписку
+            if await self.check_subscription(user_id):
+                self._processing[user_str] = False
+                return
+            
+            # Пользователь не подписан
+            self._cache['pending_users'].add(user_str)
             message_text = self.get_not_subscribed_message()
-            sent_msg = await message.respond(message_text)
-            await self.pin_message(user_id, sent_msg.id)
-            await self.save_not_subscribed_msg(user_id, sent_msg.id)
-        
-        await message.delete()
+            await message.respond(message_text)
+            await message.delete()
+            
+        except Exception as e:
+            print(f"Ошибка в watcher: {e}")
+        finally:
+            if 'user_str' in locals():
+                self._processing[user_str] = False
 
     @loader.command()
     async def sublist(self, message):
-        """Показать список пользователей с сообщениями о подписке"""
-        if not self.not_subscribed_msgs:
-            await utils.answer(message, "Нет пользователей с активными сообщениями о подписке")
+        """Показать список пользователей ожидающих подписки"""
+        if not self._cache['pending_users']:
+            await utils.answer(message, "Нет пользователей ожидающих подписки")
             return
         
-        text = "<b>Пользователи с сообщениями о подписке:</b>\n\n"
-        count = 0
-        for user_id_str in self.not_subscribed_msgs:
-            user_id = int(user_id_str)
-            try:
-                user = await self.client.get_entity(user_id)
-                name = f"{user.first_name or ''} {user.last_name or ''}".strip() or user.username or str(user_id)
-                
-                is_subscribed = await self.check_subscription(user_id)
-                sub_status = "Подписан" if is_subscribed else "Не подписан"
-                whitelist_status = "В белом списке" if self.is_whitelisted(user_id) else "Не в белом списке"
-                
-                text += f"{name} (ID: {user_id})\nСтатус: {sub_status}, {whitelist_status}\n"
-                count += 1
-            except:
-                text += f"ID: {user_id}\n"
-                count += 1
+        text = f"<b>Пользователи ожидающие подписку:</b> {len(self._cache['pending_users'])}\n\n"
         
-        text += f"\n<b>Всего:</b> {count}\n\n"
-        text += f"Сообщения автоматически удаляются после подписки на канал"
+        for i, user_str in enumerate(list(self._cache['pending_users'])[:15], 1):
+            try:
+                user_id = int(user_str)
+                user = await self.client.get_entity(user_id)
+                name = user.first_name or user.username or user_str
+                text += f"{i}. {name} (ID: {user_id})\n"
+            except:
+                text += f"{i}. ID: {user_str}\n"
+        
+        if len(self._cache['pending_users']) > 15:
+            text += f"\n<b>И еще:</b> {len(self._cache['pending_users']) - 15} пользователей..."
+        
+        text += "\n\nСообщения автоматически удаляются после подписки"
         
         await utils.answer(message, text)
 
     @loader.command()
     async def subclean(self, message):
-        """Очистить все сообщения о подписке"""
-        count = 0
-        for user_id_str in list(self.not_subscribed_msgs.keys()):
-            user_id = int(user_id_str)
-            try:
-                await self.client.delete_messages(user_id, self.not_subscribed_msgs[user_id_str])
-                count += 1
-            except:
-                pass
-        
-        self.not_subscribed_msgs = {}
-        self.db.set("SubChecker", "not_subscribed_msgs", self.not_subscribed_msgs)
-        
-        await utils.answer(message, f"<b>Удалено {count} сообщений о подписке</b>")
+        """Очистить список ожидающих"""
+        count = len(self._cache['pending_users'])
+        self._cache['pending_users'].clear()
+        await utils.answer(message, f"<b>Очищено {count} пользователей из списка ожидания</b>")
