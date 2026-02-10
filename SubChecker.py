@@ -4,15 +4,18 @@ from telethon.tl.functions.messages import ReportSpamRequest
 from telethon.tl.types import User
 from telethon.tl.functions.messages import UpdatePinnedMessageRequest
 from .. import loader, utils
+import asyncio
+import time
+from datetime import datetime, timedelta
 
 @loader.tds
 class SubCheckBot(loader.Module):
-    """Буст канала от @InsModule"""
+    """Буст канала от @SheoMod"""
     
     strings = {
         'name': 'SubChecker',
-        'not_subscribed': "<b>Вы не подписаны на наш канал!</b>\nПожалуйста, подпишитесь на канал {channel_link}, чтобы продолжить общение.",
-        'subscribed': "<b>Спасибо за подписку! Теперь вы можете свободно писать в лс.</b>",
+        'not_subscribed': "<b>Вы не подписаны на наш канал!</b>\nПожалуйста, подпишитесь на канал {channel_link}, чтобы продолжить общение.\n\n<b>В течении минуты вас разблокируют.</b>",
+        'subscribed': "<b>Спасибо за подписку! Вы были разблокированы.</b>",
         'channel_not_set': "<b>Канал для проверки подписки не настроен!</b>\n\nИспользуйте команду .subchannel [юзернейм или ссылка] для настройки канала.\nПример: .subchannel @my_channel",
         'channel_set': "<b>Канал для проверки подписки установлен:</b> {}",
         'current_channel': "<b>Текущий канал для проверки:</b> {}\n\n<b>ID канала:</b> <code>{}</code>",
@@ -34,8 +37,29 @@ class SubCheckBot(loader.Module):
         'user_in_whitelist': "<b>Пользователь в белом списке</b>\n\nID: <code>{}</code>\nДобавлен: {}",
         'user_not_in_whitelist': "<b>Пользователь не в белом списке!</b>",
         'invalid_user_id': "<b>Неверный ID пользователя!</b>\nID должен быть числом.",
-        'no_reply': "<b>Ответьте на сообщение пользователя или укажите ID!</b>"
+        'no_reply': "<b>Ответьте на сообщение пользователя или укажите ID!</b>",
+        'check_interval_set': "<b>Интервал проверки установлен:</b> {} секунд\n\nМинимальное значение: 30 секунд",
+        'current_check_interval': "<b>Текущий интервал проверки:</b> {} секунд",
+        'invalid_interval': "<b>Неверный интервал!</b>\n\nУкажите число секунд (минимум 30).",
+        'user_blocked': "<b>Пользователь заблокирован!</b>\n\nID: <code>{}</code>\nПричина: не подписан на канал",
+        'user_unblocked': "<b>Пользователь разблокирован!</b>\n\nID: <code>{}</code>\nПричина: подписался на канал",
+        'blocked_users': "<b>Заблокированные пользователи:</b>\n\n{}",
+        'no_blocked_users': "<b>Нет заблокированных пользователей!</b>",
+        'blocked_user_info': "<b>Информация о блокировке:</b>\n\nID: <code>{}</code>\nЗаблокирован: {}\nПроверок: {}\nПоследняя проверка: {}",
+        'checking_subscriptions': "<b>Запущена фоновая проверка подписок...</b>\n\nПроверяем {} пользователей",
+        'check_complete': "<b>Проверка завершена!</b>\n\nПроверено: {}\nРазблокировано: {}\nВсе еще не подписаны: {}",
+        'force_check_started': "<b>Принудительная проверка запущена!</b>\n\nПроверяем {} пользователей...",
+        'subscribers_cache_info': "<b>Кэш подписчиков обновлен!</b>\n\nКоличество подписчиков: {}\nВремя обновления: {}",
+        'cache_cleared': "<b>Кэш подписчиков очищен!</b>",
+        'blocked_list_cleared': "<b>Список заблокированных пользователей очищен!</b>\n\nУдалено: {} пользователей",
     }
+
+    def __init__(self):
+        self.check_task = None
+        self.check_running = False
+        self.subscribers_cache = set()  # Кэш ID подписчиков
+        self.last_cache_update = None
+        self.cache_ttl = 300  # 5 минут TTL для кэша
 
     async def client_ready(self, client, db):
         self.client = client
@@ -55,20 +79,255 @@ class SubCheckBot(loader.Module):
         # Загрузка белого списка
         self.whitelist = self.db.get("SubChecker", "whitelist", {})
         
+        # Загрузка заблокированных пользователей
+        self.blocked_users = self.db.get("SubChecker", "blocked_users", {})
+        
+        # Интервал проверки (по умолчанию 60 секунд)
+        self.check_interval = self.db.get("SubChecker", "check_interval", 60)
+        if self.check_interval < 30:
+            self.check_interval = 30
+        
         # Включение/выключение модуля
         self.enabled = self.db.get("SubChecker", "enabled", True)
+        
+        # Загрузка кэша подписчиков
+        cache_data = self.db.get("SubChecker", "subscribers_cache", {})
+        self.subscribers_cache = set(cache_data.get('ids', []))
+        self.last_cache_update = cache_data.get('last_update')
+        
+        # Запуск фоновой проверки
+        if self.enabled and self.channel_id and not self.check_running:
+            await self.start_background_checker()
 
-    async def check_subscription(self, user_id):
-        """Проверка подписки пользователя на канал"""
+    async def start_background_checker(self):
+        """Запуск фоновой проверки"""
+        if self.check_task and not self.check_task.done():
+            return
+        
+        self.check_running = True
+        self.check_task = asyncio.create_task(self.background_checker())
+
+    async def stop_background_checker(self):
+        """Остановка фоновой проверки"""
+        self.check_running = False
+        if self.check_task and not self.check_task.done():
+            self.check_task.cancel()
+            try:
+                await self.check_task
+            except asyncio.CancelledError:
+                pass
+        self.check_task = None
+
+    async def update_subscribers_cache(self):
+        """Обновление кэша подписчиков"""
         if not self.channel_id:
             return False
         
         try:
-            participants = await self.client.get_participants(self.channel_id, limit=10000)
-            return any(participant.id == user_id for participant in participants)
+            print(f"Обновление кэша подписчиков для канала {self.channel_id}...")
+            
+            all_participants = []
+            
+            # Используем итератор для получения всех участников
+            async for participant in self.client.iter_participants(
+                self.channel_id,
+                aggressive=True
+            ):
+                all_participants.append(participant)
+                if len(all_participants) % 100 == 0:
+                    await asyncio.sleep(0.5)  # Задержка чтобы не спамить
+            
+            # Обновляем кэш
+            self.subscribers_cache = {p.id for p in all_participants}
+            self.last_cache_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Сохраняем в БД
+            self.db.set("SubChecker", "subscribers_cache", {
+                'ids': list(self.subscribers_cache),
+                'last_update': self.last_cache_update,
+                'count': len(self.subscribers_cache)
+            })
+            
+            print(f"Кэш подписчиков обновлен: {len(self.subscribers_cache)} участников")
+            return True
+            
         except Exception as e:
-            print(f"Ошибка проверки подписки: {e}")
+            print(f"Ошибка обновления кэша подписчиков: {e}")
             return False
+
+    def is_cache_valid(self):
+        """Проверка валидности кэша"""
+        if not self.last_cache_update or not self.subscribers_cache:
+            return False
+        
+        try:
+            last_update = datetime.strptime(self.last_cache_update, "%Y-%m-%d %H:%M:%S")
+            now = datetime.now()
+            return (now - last_update).total_seconds() < self.cache_ttl
+        except:
+            return False
+
+    async def background_checker(self):
+        """Фоновая проверка подписок заблокированных пользователей"""
+        # Сначала обновляем кэш подписчиков
+        await self.update_subscribers_cache()
+        
+        while self.check_running:
+            try:
+                if not self.enabled or not self.channel_id:
+                    await asyncio.sleep(60)
+                    continue
+                
+                # Обновляем кэш если устарел
+                if not self.is_cache_valid():
+                    await self.update_subscribers_cache()
+                
+                # Делаем копию списка для безопасной итерации
+                blocked_users_copy = self.blocked_users.copy()
+                
+                if not blocked_users_copy:
+                    await asyncio.sleep(self.check_interval)
+                    continue
+                
+                # Проверяем каждого заблокированного пользователя
+                for user_id_str in list(blocked_users_copy.keys()):
+                    if not self.check_running:
+                        break
+                        
+                    user_id = int(user_id_str)
+                    
+                    # Пропускаем если пользователь в белом списке
+                    if self.is_whitelisted(user_id):
+                        if user_id_str in self.blocked_users:
+                            await self.unblock_user(user_id, "пользователь в белом списке")
+                        continue
+                    
+                    # Проверяем подписку через кэш
+                    if user_id in self.subscribers_cache:
+                        # Пользователь подписался - разблокируем
+                        await self.unblock_user(user_id, "подписался на канал")
+                    else:
+                        # Двойная проверка на случай если кэш устарел
+                        try:
+                            is_subscribed = await self.check_subscription_direct(user_id)
+                            if is_subscribed:
+                                await self.unblock_user(user_id, "подписался на канал")
+                                # Обновляем кэш
+                                self.subscribers_cache.add(user_id)
+                        except:
+                            pass
+                        
+                        # Обновляем счетчик проверок
+                        if user_id_str in self.blocked_users:
+                            self.blocked_users[user_id_str]['check_count'] = self.blocked_users[user_id_str].get('check_count', 0) + 1
+                            self.blocked_users[user_id_str]['last_check'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            self.db.set("SubChecker", "blocked_users", self.blocked_users)
+                
+                # Ждем перед следующей проверкой
+                await asyncio.sleep(self.check_interval)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"Ошибка в фоновой проверке: {e}")
+                await asyncio.sleep(60)
+
+    async def block_user(self, user_id):
+        """Блокировка пользователя"""
+        try:
+            await self.client(BlockRequest(id=user_id))
+            
+            # Сохраняем информацию о блокировке
+            self.blocked_users[str(user_id)] = {
+                'user_id': user_id,
+                'blocked_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'last_check': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'check_count': 0,
+                'reason': 'not_subscribed'
+            }
+            self.db.set("SubChecker", "blocked_users", self.blocked_users)
+            
+            return True
+        except Exception as e:
+            print(f"Ошибка блокировки пользователя {user_id}: {e}")
+            return False
+
+    async def unblock_user(self, user_id, reason="подписался на канал"):
+        """Разблокировка пользователя"""
+        try:
+            await self.client(UnblockRequest(id=user_id))
+            
+            # Удаляем из списка заблокированных
+            user_id_str = str(user_id)
+            if user_id_str in self.blocked_users:
+                del self.blocked_users[user_id_str]
+                self.db.set("SubChecker", "blocked_users", self.blocked_users)
+            
+            # Удаляем сообщение о подписке если есть
+            if user_id_str in self.not_subscribed_msgs:
+                await self.delete_not_subscribed_msg(user_id)
+            
+            # Отправляем сообщение о разблокировке
+            try:
+                await self.client.send_message(
+                    user_id,
+                    self.strings['subscribed']
+                )
+            except:
+                pass
+            
+            print(f"Пользователь {user_id} разблокирован: {reason}")
+            return True
+        except Exception as e:
+            print(f"Ошибка разблокировки пользователя {user_id}: {e}")
+            return False
+
+    async def check_subscription_direct(self, user_id):
+        """Прямая проверка подписки пользователя на канал"""
+        if not self.channel_id:
+            return False
+        
+        try:
+            # Проверяем через get_participants с фильтром по ID
+            participants = await self.client.get_participants(
+                self.channel_id,
+                filter=User(id=user_id),
+                limit=1
+            )
+            
+            return len(participants) > 0 and participants[0].id == user_id
+        except:
+            # Альтернативный метод - итерация
+            try:
+                async for participant in self.client.iter_participants(
+                    self.channel_id,
+                    search=str(user_id),
+                    limit=10
+                ):
+                    if participant.id == user_id:
+                        return True
+                    await asyncio.sleep(0.01)
+            except:
+                pass
+            
+            return False
+
+    async def check_subscription(self, user_id):
+        """Оптимизированная проверка подписки пользователя на канал"""
+        if not self.channel_id:
+            return False
+        
+        # Сначала проверяем кэш
+        if user_id in self.subscribers_cache:
+            return True
+        
+        # Если кэш невалиден, обновляем его
+        if not self.is_cache_valid():
+            await self.update_subscribers_cache()
+            return user_id in self.subscribers_cache
+        
+        # Двойная проверка на случай если пользователь недавно подписался
+        return await self.check_subscription_direct(user_id)
 
     def is_bot(self, user):
         """Проверка, является ли пользователь ботом"""
@@ -82,13 +341,16 @@ class SubCheckBot(loader.Module):
 
     def add_to_whitelist(self, user_id, added_by=None):
         """Добавление пользователя в белый список"""
-        from datetime import datetime
         self.whitelist[str(user_id)] = {
             'added_by': added_by,
             'added_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'user_id': user_id
         }
         self.db.set("SubChecker", "whitelist", self.whitelist)
+        
+        # Если пользователь был заблокирован - разблокируем
+        if str(user_id) in self.blocked_users:
+            asyncio.create_task(self.unblock_user(user_id, "добавлен в белый список"))
 
     def remove_from_whitelist(self, user_id):
         """Удаление пользователя из белого списка"""
@@ -151,21 +413,27 @@ class SubCheckBot(loader.Module):
         command = parts[0].lower()
         
         if command == "add":
-            if len(parts) < 2:
-                await utils.answer(message, "<b>Используйте:</b> .subwl add [ID]\n<b>Или ответьте на сообщение пользователя:</b> .subwl add")
-                return
+            # Определяем ID пользователя
+            user_id = None
             
-            # Проверка, есть ли reply
             if message.is_reply:
+                # Используем реплай
                 reply = await message.get_reply_message()
-                user = await reply.get_sender()
-                user_id = user.id
-            else:
+                if reply:
+                    sender = await reply.get_sender()
+                    if sender:
+                        user_id = sender.id
+            
+            if user_id is None and len(parts) > 1:
+                # Используем аргумент
                 try:
                     user_id = int(parts[1])
                 except ValueError:
                     await utils.answer(message, self.strings['invalid_user_id'])
                     return
+            elif user_id is None:
+                await utils.answer(message, self.strings['no_reply'])
+                return
             
             # Проверка, не в белом списке ли уже
             if self.is_whitelisted(user_id):
@@ -182,21 +450,27 @@ class SubCheckBot(loader.Module):
                 await message.respond(f"<b>Пользователь добавлен в белый список и разблокирован!</b>\n\nID: <code>{user_id}</code>")
         
         elif command == "remove":
-            if len(parts) < 2:
-                await utils.answer(message, "<b>Используйте:</b> .subwl remove [ID]\n<b>Или ответьте на сообщение пользователя:</b> .subwl remove")
-                return
+            # Определяем ID пользователя
+            user_id = None
             
-            # Проверка, есть ли reply
             if message.is_reply:
+                # Используем реплай
                 reply = await message.get_reply_message()
-                user = await reply.get_sender()
-                user_id = user.id
-            else:
+                if reply:
+                    sender = await reply.get_sender()
+                    if sender:
+                        user_id = sender.id
+            
+            if user_id is None and len(parts) > 1:
+                # Используем аргумент
                 try:
                     user_id = int(parts[1])
                 except ValueError:
                     await utils.answer(message, self.strings['invalid_user_id'])
                     return
+            elif user_id is None:
+                await utils.answer(message, self.strings['no_reply'])
+                return
             
             # Удаление из белого списка
             if self.remove_from_whitelist(user_id):
@@ -209,7 +483,7 @@ class SubCheckBot(loader.Module):
                 await utils.answer(message, self.strings['whitelist_empty'])
                 return
             
-            text = "<b>Белый список пользователей:</b>\n\n"
+            text = f"<b>Белый список пользователей:</b> {len(self.whitelist)}\n\n"
             count = 0
             
             for user_id_str, data in self.whitelist.items():
@@ -218,26 +492,37 @@ class SubCheckBot(loader.Module):
                     user_info = f"<b>ID:</b> <code>{user_id}</code>\n"
                     user_info += f"<b>Добавлен:</b> {data.get('added_at', 'Неизвестно')}\n"
                     
-                    # Попробуем получить имя пользователя
+                    # Получаем имя пользователя
                     try:
                         user = await self.client.get_entity(user_id)
-                        name = f"{user.first_name or ''} {user.last_name or ''}".strip() or user.username or "Неизвестно"
+                        name_parts = []
+                        if getattr(user, 'first_name', None):
+                            name_parts.append(user.first_name)
+                        if getattr(user, 'last_name', None):
+                            name_parts.append(user.last_name)
+                        
+                        name = " ".join(name_parts) if name_parts else "Без имени"
+                        
+                        if getattr(user, 'username', None):
+                            name += f" (@{user.username})"
+                        
                         user_info += f"<b>Имя:</b> {name}\n"
                     except:
-                        user_info += f"<b>Имя:</b> Не удалось получить\n"
+                        user_info += f"<b>Имя:</b> Неизвестно\n"
                     
                     text += user_info + "─" * 20 + "\n"
                     count += 1
                     
                     # Ограничим вывод чтобы не превысить лимит сообщения
-                    if count >= 20:
-                        text += f"\n<b>И еще:</b> {len(self.whitelist) - count} пользователей..."
+                    if count >= 15:
+                        remaining = len(self.whitelist) - count
+                        if remaining > 0:
+                            text += f"\n<b>И еще {remaining} пользователей...</b>"
                         break
                         
                 except Exception as e:
                     continue
             
-            text = self.strings['whitelist_list'].format(f"Всего: {len(self.whitelist)}\n\n") + text
             await utils.answer(message, text)
         
         elif command == "clear":
@@ -247,21 +532,27 @@ class SubCheckBot(loader.Module):
             await utils.answer(message, self.strings['whitelist_cleared'].format(count))
         
         elif command == "check":
-            if len(parts) < 2:
-                await utils.answer(message, "<b>Используйте:</b> .subwl check [ID]\n<b>Или ответьте на сообщение пользователя:</b> .subwl check")
-                return
+            # Определяем ID пользователя
+            user_id = None
             
-            # Проверка, есть ли reply
             if message.is_reply:
+                # Используем реплай
                 reply = await message.get_reply_message()
-                user = await reply.get_sender()
-                user_id = user.id
-            else:
+                if reply:
+                    sender = await reply.get_sender()
+                    if sender:
+                        user_id = sender.id
+            
+            if user_id is None and len(parts) > 1:
+                # Используем аргумент
                 try:
                     user_id = int(parts[1])
                 except ValueError:
                     await utils.answer(message, self.strings['invalid_user_id'])
                     return
+            elif user_id is None:
+                await utils.answer(message, self.strings['no_reply'])
+                return
             
             # Проверка наличия в белом списке
             if self.is_whitelisted(user_id):
@@ -355,6 +646,16 @@ class SubCheckBot(loader.Module):
                 self.strings['channel_set'].format(channel_info)
             )
             
+            # Перезапускаем фоновую проверку при смене канала
+            await self.stop_background_checker()
+            
+            # Очищаем кэш
+            self.subscribers_cache = set()
+            self.last_cache_update = None
+            
+            if self.enabled and self.channel_id:
+                await self.start_background_checker()
+            
         except Exception as e:
             await utils.answer(message, 
                 self.strings['invalid_channel'] + f"\n\n<code>{str(e)}</code>"
@@ -369,7 +670,6 @@ class SubCheckBot(loader.Module):
         
         try:
             channel = await self.client.get_entity(self.channel_id)
-            participants = await self.client.get_participants(self.channel_id, limit=1)
             
             channel_info = []
             if hasattr(channel, 'title'):
@@ -377,7 +677,14 @@ class SubCheckBot(loader.Module):
             if hasattr(channel, 'username'):
                 channel_info.append(f"<b>Юзернейм:</b> @{channel.username}")
             channel_info.append(f"<b>ID:</b> <code>{channel.id}</code>")
-            channel_info.append(f"<b>Участников:</b> {channel.participants_count if hasattr(channel, 'participants_count') else 'N/A'}")
+            
+            # Пробуем получить количество участников
+            try:
+                count = await self.client.get_participants(self.channel_id, limit=1)
+                channel_info.append(f"<b>Доступ к участникам:</b> ✅")
+                channel_info.append(f"<b>Примерный размер:</b> {getattr(channel, 'participants_count', 'N/A')}")
+            except Exception as e:
+                channel_info.append(f"<b>Доступ к участникам:</b> ❌ ({str(e)})")
             
             await utils.answer(message, 
                 self.strings['test_success'] + "\n\n" + "\n".join(channel_info)
@@ -397,8 +704,6 @@ class SubCheckBot(loader.Module):
         """Включить/выключить проверку подписки"""
         args = utils.get_args_raw(message)
         
-        enabled = self.db.get("SubChecker", "enabled", True)
-        
         if args.lower() == "on":
             if not self.channel_id:
                 await utils.answer(message, self.strings['channel_not_set'])
@@ -406,18 +711,28 @@ class SubCheckBot(loader.Module):
                 
             self.db.set("SubChecker", "enabled", True)
             self.enabled = True
+            
+            # Запускаем фоновую проверку
+            await self.start_background_checker()
+            
         elif args.lower() == "off":
             self.db.set("SubChecker", "enabled", False)
             self.enabled = False
+            
+            # Останавливаем фоновую проверку
+            await self.stop_background_checker()
         
         status_text = "Включена" if self.enabled else "Выключена"
         channel_status = "Настроен" if self.channel_id else "Не настроен"
         whitelist_status = f"{len(self.whitelist)} пользователей"
+        blocked_status = f"{len(self.blocked_users)} пользователей"
         
         response = "<b>Статус проверки подписки:</b>\n\n"
         response += f"<b>Проверка:</b> {status_text}\n"
         response += f"<b>Канал:</b> {channel_status}\n"
         response += f"<b>Белый список:</b> {whitelist_status}\n"
+        response += f"<b>Заблокировано:</b> {blocked_status}\n"
+        response += f"<b>Интервал проверки:</b> {self.check_interval} сек\n"
         
         if self.channel_username:
             response += f"<b>Текущий канал:</b> {self.channel_username}\n"
@@ -427,68 +742,215 @@ class SubCheckBot(loader.Module):
         response += ".subchannel @юзернейм - установить канал\n"
         response += ".submessage текст - кастомное сообщение\n"
         response += ".subwl - управление белым списком\n"
+        response += ".subinterval N - интервал проверки (сек)\n"
+        response += ".subblocked - список заблокированных\n"
+        response += ".subblockedclear - очистить заблокированных\n"
+        response += ".subforcecheck - принудительная проверка\n"
+        response += ".subcache - обновить кэш подписчиков\n"
         
         await utils.answer(message, response)
 
-    async def watcher(self, message):
-        """Обработчик входящих сообщений"""
+    @loader.command()
+    async def subinterval(self, message):
+        """Установить интервал проверки подписок (в секундах, минимум 30)"""
+        args = utils.get_args_raw(message)
         
-        # Проверка включен ли модуль
-        if not self.enabled:
+        if not args:
+            await utils.answer(message, 
+                self.strings['current_check_interval'].format(self.check_interval)
+            )
             return
         
-        # Проверка настроен ли канал
-        if not self.channel_id:
-            print("Канал не настроен")
-            return
-            
-        # Проверка что сообщение в личке
-        if not message.is_private:
-            return
-        
-        # Проверка что сообщение не исходящее
-        if message.out:
-            return
-        
-        # Получение информации об отправителе
         try:
-            user = await message.get_sender()
-        except:
-            print("Не удалось получить информацию об отправителе")
+            interval = int(args)
+            if interval < 30:
+                interval = 30
+            
+            self.check_interval = interval
+            self.db.set("SubChecker", "check_interval", interval)
+            
+            await utils.answer(message, 
+                self.strings['check_interval_set'].format(interval)
+            )
+            
+            # Перезапускаем фоновую задачу если она работает
+            if self.check_running:
+                await self.stop_background_checker()
+                await self.start_background_checker()
+                
+        except ValueError:
+            await utils.answer(message, self.strings['invalid_interval'])
+
+    @loader.command()
+    async def subblocked(self, message):
+        """Показать список заблокированных пользователей"""
+        args = utils.get_args_raw(message)
+        
+        if not self.blocked_users:
+            await utils.answer(message, self.strings['no_blocked_users'])
             return
         
-        # Проверка что отправитель не бот
-        if self.is_bot(user):
-            print(f"Сообщение от бота {user.id}, игнорируем")
+        if args:
+            # Информация о конкретном пользователе
+            try:
+                user_id = int(args)
+                user_id_str = str(user_id)
+                
+                if user_id_str not in self.blocked_users:
+                    await utils.answer(message, f"<b>Пользователь не найден в списке заблокированных!</b>\n\nID: <code>{user_id}</code>")
+                    return
+                
+                data = self.blocked_users[user_id_str]
+                
+                # Получаем информацию о пользователе
+                try:
+                    user = await self.client.get_entity(user_id)
+                    name_parts = []
+                    if getattr(user, 'first_name', None):
+                        name_parts.append(user.first_name)
+                    if getattr(user, 'last_name', None):
+                        name_parts.append(user.last_name)
+                    name = " ".join(name_parts) if name_parts else "Без имени"
+                    user_info = f"<b>Имя:</b> {name}\n"
+                except:
+                    user_info = ""
+                
+                info = self.strings['blocked_user_info'].format(
+                    user_id,
+                    data.get('blocked_at', 'Неизвестно'),
+                    data.get('check_count', 0),
+                    data.get('last_check', 'Никогда')
+                )
+                
+                info = user_info + info
+                
+                # Проверяем текущий статус подписки
+                is_subscribed = await self.check_subscription(user_id)
+                sub_status = "✅ Подписан" if is_subscribed else "❌ Не подписан"
+                info += f"\n<b>Текущий статус подписки:</b> {sub_status}"
+                
+                await utils.answer(message, info)
+                
+            except ValueError:
+                await utils.answer(message, self.strings['invalid_user_id'])
             return
         
-        user_id = user.id
+        # Показываем список всех заблокированных
+        text = f"<b>Заблокировано пользователей:</b> {len(self.blocked_users)}\n\n"
         
-        # Проверка белого списка
-        if self.is_whitelisted(user_id):
-            print(f"Пользователь {user_id} в белом списке, проверка подписки пропускается")
+        count = 0
+        for user_id_str, data in self.blocked_users.items():
+            try:
+                user_id = int(user_id_str)
+                try:
+                    user = await self.client.get_entity(user_id)
+                    name_parts = []
+                    if getattr(user, 'first_name', None):
+                        name_parts.append(user.first_name)
+                    if getattr(user, 'last_name', None):
+                        name_parts.append(user.last_name)
+                    name = " ".join(name_parts) if name_parts else str(user_id)
+                except:
+                    name = str(user_id)
+                
+                blocked_time = data.get('blocked_at', 'Неизвестно')
+                check_count = data.get('check_count', 0)
+                
+                text += f"<b>{name}</b>\nID: <code>{user_id}</code>\nЗаблокирован: {blocked_time}\nПроверок: {check_count}\n"
+                text += "─" * 20 + "\n"
+                
+                count += 1
+                if count >= 15:  # Ограничим вывод
+                    remaining = len(self.blocked_users) - count
+                    if remaining > 0:
+                        text += f"\n<b>И еще {remaining} пользователей...</b>"
+                    break
+                    
+            except:
+                continue
+        
+        text += f"\n<b>Интервал проверки:</b> {self.check_interval} секунд"
+        text += f"\n<b>Используйте:</b> .subblocked [ID] для подробной информации"
+        text += f"\n<b>Очистить список:</b> .subblockedclear"
+        
+        await utils.answer(message, text)
+
+    @loader.command()
+    async def subblockedclear(self, message):
+        """Очистить список заблокированных пользователей"""
+        if not self.blocked_users:
+            await utils.answer(message, self.strings['no_blocked_users'])
             return
         
-        # Проверка подписки
-        is_subscribed = await self.check_subscription(user_id)
+        # Счетчик для статистики
+        count = len(self.blocked_users)
         
-        # Если подписан
-        if is_subscribed:
-            if str(user_id) in self.not_subscribed_msgs:
-                print(f"Пользователь {user_id} подписался, удаляем сообщение с просьбой подписаться")
-                await self.delete_not_subscribed_msg(user_id)
-                await message.respond(self.strings['subscribed'])
+        # Получаем список ID пользователей
+        user_ids = list(self.blocked_users.keys())
+        
+        # Разблокируем всех пользователей
+        for user_id_str in user_ids:
+            try:
+                user_id = int(user_id_str)
+                await self.unblock_user(user_id, "список заблокированных очищен")
+            except:
+                pass
+        
+        # Очищаем список
+        self.blocked_users = {}
+        self.db.set("SubChecker", "blocked_users", self.blocked_users)
+        
+        await utils.answer(message, self.strings['blocked_list_cleared'].format(count))
+
+    @loader.command()
+    async def subforcecheck(self, message):
+        """Принудительная проверка всех заблокированных пользователей"""
+        if not self.blocked_users:
+            await utils.answer(message, self.strings['no_blocked_users'])
             return
         
-        # Если не подписан
-        print(f"Пользователь {user_id} не подписан, удаляем сообщение")
+        await utils.answer(message, 
+            self.strings['force_check_started'].format(len(self.blocked_users))
+        )
         
-        if str(user_id) not in self.not_subscribed_msgs:
-            message_text = self.get_not_subscribed_message()
-            sent_msg = await message.respond(message_text)
-            await self.save_not_subscribed_msg(user_id, sent_msg.id)
+        unblocked_count = 0
+        checked_count = 0
         
-        await message.delete()
+        # Сначала обновляем кэш
+        await self.update_subscribers_cache()
+        
+        # Проверяем каждого заблокированного пользователя
+        for user_id_str in list(self.blocked_users.keys()):
+            user_id = int(user_id_str)
+            checked_count += 1
+            
+            # Пропускаем если пользователь в белом списке
+            if self.is_whitelisted(user_id):
+                await self.unblock_user(user_id, "пользователь в белом списке")
+                unblocked_count += 1
+                continue
+            
+            # Проверяем подписку
+            is_subscribed = await self.check_subscription(user_id)
+            if is_subscribed:
+                # Пользователь подписался - разблокируем
+                await self.unblock_user(user_id, "подписался на канал")
+                unblocked_count += 1
+            else:
+                # Обновляем счетчик проверок
+                self.blocked_users[user_id_str]['check_count'] = self.blocked_users[user_id_str].get('check_count', 0) + 1
+                self.blocked_users[user_id_str]['last_check'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.db.set("SubChecker", "blocked_users", self.blocked_users)
+        
+        still_blocked = len(self.blocked_users)
+        
+        result = self.strings['check_complete'].format(
+            checked_count,
+            unblocked_count,
+            still_blocked
+        )
+        
+        await utils.answer(message, result)
 
     @loader.command()
     async def sublist(self, message):
@@ -503,16 +965,30 @@ class SubCheckBot(loader.Module):
             user_id = int(user_id_str)
             try:
                 user = await self.client.get_entity(user_id)
-                name = f"{user.first_name or ''} {user.last_name or ''}".strip() or user.username or str(user_id)
+                name_parts = []
+                if getattr(user, 'first_name', None):
+                    name_parts.append(user.first_name)
+                if getattr(user, 'last_name', None):
+                    name_parts.append(user.last_name)
+                name = " ".join(name_parts) if name_parts else str(user_id)
                 
                 is_subscribed = await self.check_subscription(user_id)
-                sub_status = "Подписан" if is_subscribed else "Не подписан"
-                whitelist_status = "В белом списке" if self.is_whitelisted(user_id) else "Не в белом списке"
+                sub_status = "✅ Подписан" if is_subscribed else "❌ Не подписан"
+                whitelist_status = "✅ В белом списке" if self.is_whitelisted(user_id) else "❌ Не в белом списке"
+                blocked_status = "✅ Заблокирован" if str(user_id) in self.blocked_users else "❌ Не заблокирован"
                 
-                text += f"{name} (ID: {user_id})\nСтатус: {sub_status}, {whitelist_status}\n"
+                text += f"{name} (ID: {user_id})\nСтатус: {sub_status}, {whitelist_status}, {blocked_status}\n"
+                text += "─" * 20 + "\n"
                 count += 1
+                
+                if count >= 15:
+                    remaining = len(self.not_subscribed_msgs) - count
+                    if remaining > 0:
+                        text += f"\n<b>И еще {remaining} пользователей...</b>"
+                    break
             except:
                 text += f"ID: {user_id}\n"
+                text += "─" * 20 + "\n"
                 count += 1
         
         text += f"\n<b>Всего:</b> {count}\n\n"
@@ -536,3 +1012,98 @@ class SubCheckBot(loader.Module):
         self.db.set("SubChecker", "not_subscribed_msgs", self.not_subscribed_msgs)
         
         await utils.answer(message, f"<b>Удалено {count} сообщений о подписке</b>")
+
+    @loader.command()
+    async def subcache(self, message):
+        """Обновить кэш подписчиков"""
+        if not self.channel_id:
+            await utils.answer(message, self.strings['channel_not_set'])
+            return
+        
+        await utils.answer(message, "<b>Обновление кэша подписчиков...</b>")
+        
+        if await self.update_subscribers_cache():
+            await utils.answer(message, self.strings['subscribers_cache_info'].format(
+                len(self.subscribers_cache),
+                self.last_cache_update or "Только что"
+            ))
+        else:
+            await utils.answer(message, "<b>Ошибка обновления кэша!</b>")
+
+    @loader.command()
+    async def subcacheclear(self, message):
+        """Очистить кэш подписчиков"""
+        self.subscribers_cache = set()
+        self.last_cache_update = None
+        self.db.set("SubChecker", "subscribers_cache", {})
+        
+        await utils.answer(message, self.strings['cache_cleared'])
+
+    async def watcher(self, message):
+        """Обработчик входящих сообщений"""
+        
+        # Проверка включен ли модуль
+        if not self.enabled:
+            return
+        
+        # Проверка настроен ли канал
+        if not self.channel_id:
+            return
+            
+        # Проверка что сообщение в личке
+        if not message.is_private:
+            return
+        
+        # Проверка что сообщение не исходящее
+        if message.out:
+            return
+        
+        # Получение информации об отправителе
+        try:
+            user = await message.get_sender()
+        except:
+            return
+        
+        # Проверка что отправитель не бот
+        if self.is_bot(user):
+            return
+        
+        user_id = user.id
+        
+        # Проверка белого списка
+        if self.is_whitelisted(user_id):
+            # Если пользователь был заблокирован, разблокируем
+            if str(user_id) in self.blocked_users:
+                await self.unblock_user(user_id, "пользователь в белом списке")
+            return
+        
+        # Проверка подписки через оптимизированный метод
+        is_subscribed = await self.check_subscription(user_id)
+        
+        # Если подписан
+        if is_subscribed:
+            if str(user_id) in self.not_subscribed_msgs:
+                await self.delete_not_subscribed_msg(user_id)
+                await message.respond(self.strings['subscribed'])
+            
+            # Если пользователь был заблокирован, разблокируем
+            if str(user_id) in self.blocked_users:
+                await self.unblock_user(user_id, "подписался на канал")
+            
+            return
+        
+        # Если не подписан
+        # Блокируем пользователя
+        await self.block_user(user_id)
+        
+        # Отправляем сообщение о блокировке
+        if str(user_id) not in self.not_subscribed_msgs:
+            message_text = self.get_not_subscribed_message()
+            sent_msg = await message.respond(message_text)
+            await self.save_not_subscribed_msg(user_id, sent_msg.id)
+        
+        await message.delete()
+
+    # При выключении модуля останавливаем фоновую задачу
+    async def on_unload(self):
+        await self.stop_background_checker
