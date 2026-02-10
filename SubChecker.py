@@ -893,8 +893,9 @@ class SubCheckBot(loader.Module):
             try:
                 user_id = int(user_id_str)
                 await self.unblock_user(user_id, "список заблокированных очищен")
-            except:
-                pass
+            except Exception as e:
+                print(f"Ошибка при разблокировке пользователя {user_id_str}: {e}")
+                continue
         
         # Очищаем список
         self.blocked_users = {}
@@ -1106,4 +1107,4 @@ class SubCheckBot(loader.Module):
 
     # При выключении модуля останавливаем фоновую задачу
     async def on_unload(self):
-        await self.stop_background_checker
+        await self.stop_background_checker()
